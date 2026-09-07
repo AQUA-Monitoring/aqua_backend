@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import csv
 import json
-import unicodedata
 from datetime import date
 from pathlib import Path
 
@@ -21,22 +20,7 @@ from core.addressing.models import (
     AddressReference, City, GeodataDataset, Neighborhood, Region, RoadAxisSegment,
     RoadAxisSegmentNeighborhood, Street, StreetNeighborhood,
 )
-
-
-def normalized(value: str) -> str:
-    return " ".join(unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode().casefold().split())
-
-
-def canonical_name(value: str) -> str:
-    small_words = {"a", "ao", "aos", "as", "da", "das", "de", "do", "dos", "e", "em", "na", "nas", "no", "nos"}
-    formatted = []
-    for index, word in enumerate((value or "").strip().split()):
-        lower = word.casefold()
-        if index > 0 and lower in small_words:
-            formatted.append(lower)
-        else:
-            formatted.append("-".join(part[:1].upper() + part[1:].lower() for part in lower.split("-")))
-    return " ".join(formatted)
+from core.addressing.names import canonical_name, normalized
 
 
 def source_street_name(props: dict, options: dict) -> str:
@@ -148,6 +132,11 @@ class Command(BaseCommand):
             help="Campos separados por vírgula que compõem o ID da fonte (ex.: COD_UNICO_ENDERECO,COD_ESPECIE).",
         )
         parser.add_argument("--name-prop", default="name")
+        parser.add_argument(
+            "--preserve-name-case",
+            action="store_true",
+            help="Preserva a grafia fornecida pela autoridade no campo de nome.",
+        )
         parser.add_argument("--region-prop", default="region")
         parser.add_argument("--street-prop", default="street")
         parser.add_argument(
@@ -248,12 +237,16 @@ class Command(BaseCommand):
             dataset = GeodataDataset.objects.create(**dataset_values)
         try:
             with transaction.atomic():
-                previous = GeodataDataset.objects.select_for_update().filter(city=city, kind=o["kind"], authority=o["authority"], status="active")
+                previous = GeodataDataset.objects.select_for_update().filter(
+                    city=city, kind=o["kind"], status=GeodataDataset.Status.ACTIVE
+                )
+                if o["kind"] != GeodataDataset.Kind.REGION:
+                    previous = previous.filter(authority=o["authority"])
                 previous_ids = list(previous.values_list("id", flat=True))
                 previous.update(status="superseded")
                 if o["kind"] == GeodataDataset.Kind.REGION:
-                    report["inactivated"] = Region.objects.filter(city_ref=city, is_active=True).filter(
-                        Q(dataset__authority=o["authority"]) | Q(dataset__isnull=True)
+                    report["inactivated"] = Region.objects.filter(
+                        city_ref=city, is_active=True
                     ).update(is_active=False)
                 elif o["kind"] == GeodataDataset.Kind.NEIGHBORHOOD:
                     report["inactivated"] = Neighborhood.objects.filter(city_ref=city, is_active=True).filter(
@@ -276,12 +269,16 @@ class Command(BaseCommand):
                             city.normalized_name = normalized(city.name)
                             city.save(update_fields=["geometry", "source_record_id", "geometry_dataset", "official_code", "normalized_name"])
                     elif o["kind"] == GeodataDataset.Kind.REGION:
-                        objects = [Region(city=city.name, city_ref=city, dataset=dataset, source_record_id=source_id, official_code=str(props.get(o["official_code_prop"]) or "").strip(), name=(name := str(props.get(o["name_prop"]) or "").strip()), normalized_name=normalized(name), geometry=geom, props=props) for source_id, props, geom in batch]
+                        objects = []
+                        for source_id, props, geom in batch:
+                            source_name = str(props.get(o["name_prop"]) or "").strip()
+                            name = source_name if o["preserve_name_case"] else canonical_name(source_name)
+                            objects.append(Region(city=city.name, city_ref=city, dataset=dataset, source_record_id=source_id, official_code=str(props.get(o["official_code_prop"]) or "").strip(), name=name, normalized_name=normalized(name), geometry=geom, props=props))
                         Region.objects.bulk_create(objects, batch_size=o["chunk_size"])
                     elif o["kind"] == GeodataDataset.Kind.NEIGHBORHOOD:
                         objects = []
                         for source_id, props, geom in batch:
-                            name = str(props.get(o["name_prop"]) or "").strip()
+                            name = canonical_name(str(props.get(o["name_prop"]) or ""))
                             region = regions.get(normalized(str(props.get(o["region_prop"]) or "")))
                             objects.append(Neighborhood(city=city.name, city_ref=city, dataset=dataset, source_record_id=source_id, official_code=str(props.get(o["official_code_prop"]) or "").strip(), name=name, normalized_name=normalized(name), region=region, geometry=geom, props=props))
                         Neighborhood.objects.bulk_create(objects, batch_size=o["chunk_size"])
@@ -315,6 +312,99 @@ class Command(BaseCommand):
                             objects.append(AddressReference(city=city, neighborhood=neighborhood, dataset=dataset, source_record_id=source_id, street=streets.get(normalized(street_name)), street_name=street_name, number=str(props.get(o["number_prop"]) or ""), modifier=str(props.get(o["modifier_prop"]) or ""), address_type=str(props.get(o["address_type_prop"]) or ""), species=str(props.get(o["species_prop"]) or ""), complement=str(props.get(o["complement_prop"]) or ""), zipcode=str(props.get(o["zipcode_prop"]) or ""), location=point, properties=props))
                         AddressReference.objects.bulk_create(objects, batch_size=o["chunk_size"])
                     report["created"] += len(batch)
+                if o["kind"] == GeodataDataset.Kind.REGION:
+                    active_regions = Region.objects.filter(
+                        city_ref=city, is_active=True
+                    ).exclude(geometry=None)
+                    neighborhoods_to_update = []
+                    report["neighborhoods_linked"] = 0
+                    report["neighborhoods_unmatched"] = 0
+                    report["neighborhoods_ambiguous"] = 0
+                    for neighborhood in Neighborhood.objects.filter(
+                        city_ref=city, is_active=True
+                    ).exclude(geometry=None):
+                        candidates = list(
+                            active_regions.filter(
+                                geometry__covers=neighborhood.geometry.point_on_surface
+                            ).order_by("id")[:2]
+                        )
+                        target = candidates[0] if len(candidates) == 1 else None
+                        if len(candidates) == 1:
+                            report["neighborhoods_linked"] += 1
+                        elif candidates:
+                            report["neighborhoods_ambiguous"] += 1
+                        else:
+                            report["neighborhoods_unmatched"] += 1
+                        if neighborhood.region_id != getattr(target, "id", None):
+                            neighborhood.region = target
+                            neighborhoods_to_update.append(neighborhood)
+                    if neighborhoods_to_update:
+                        Neighborhood.objects.bulk_update(
+                            neighborhoods_to_update, ["region"], batch_size=o["chunk_size"]
+                        )
+                    from core.flood_camera_monitoring.infra.models import (
+                        Camera,
+                        OperationalAlert,
+                    )
+                    from core.flood_camera_monitoring.services.operational_alerts import (
+                        sync_active_alert_regions_for_camera,
+                    )
+                    from core.flood_camera_monitoring.services.territorial_context import (
+                        apply_camera_territorial_context,
+                    )
+                    from core.addressing.services import TerritoryResolutionError
+
+                    report["cameras_reprocessed"] = 0
+                    report["cameras_unresolved"] = 0
+                    report["alerts_synchronized"] = 0
+                    cameras = Camera.objects.filter(
+                        Q(city=city) | Q(address__city_ref=city)
+                    ).select_related("address", "region")
+                    for camera in cameras:
+                        latitude = (
+                            camera.address.latitude
+                            if camera.address and camera.address.latitude is not None
+                            else camera.latitude
+                        )
+                        longitude = (
+                            camera.address.longitude
+                            if camera.address and camera.address.longitude is not None
+                            else camera.longitude
+                        )
+                        if latitude is None or longitude is None:
+                            report["cameras_unresolved"] += 1
+                            continue
+                        try:
+                            apply_camera_territorial_context(
+                                camera, latitude=latitude, longitude=longitude
+                            )
+                        except TerritoryResolutionError as exc:
+                            camera.region = None
+                            camera.territory_resolution = {
+                                **(camera.territory_resolution or {}),
+                                "resolved": False,
+                                "error_code": exc.code,
+                            }
+                            report["cameras_unresolved"] += 1
+                        camera.save(
+                            update_fields=[
+                                "city", "region", "neighborhood", "street",
+                                "road_segment", "address_reference",
+                                "territory_resolution", "updated_at",
+                            ]
+                        )
+                        report["cameras_reprocessed"] += 1
+                        report["alerts_synchronized"] += sync_active_alert_regions_for_camera(
+                            camera
+                        )
+                        if camera.region_id is None:
+                            OperationalAlert.objects.filter(
+                                camera=camera,
+                                status__in=(
+                                    OperationalAlert.Status.OPEN_INDICATION,
+                                    OperationalAlert.Status.CONFIRMED,
+                                ),
+                            ).update(region=None)
                 dataset.status = GeodataDataset.Status.ACTIVE
                 dataset.metadata = {"report": report, "superseded_dataset_ids": [str(value) for value in previous_ids]}
                 dataset.save(update_fields=["status", "metadata", "updated_at"])

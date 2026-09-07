@@ -3,7 +3,7 @@ from types import ModuleType
 from unittest.mock import Mock, patch
 
 from django.db.models.deletion import ProtectedError
-from django.contrib.gis.geos import Point
+from django.contrib.gis.geos import MultiPolygon, Point, Polygon
 from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
@@ -111,7 +111,7 @@ class CameraMetadataApiTests(APITestCase):
             {"id": str(self.region.id), "name": self.region.name},
         )
 
-    def test_camera_creation_requires_neighborhood_with_active_canonical_region(self):
+    def test_camera_creation_allows_neighborhood_without_canonical_region_as_inactive(self):
         unassigned = Neighborhood.objects.create(
             name="Sem região",
             city=self.city.name,
@@ -123,8 +123,68 @@ class CameraMetadataApiTests(APITestCase):
 
         response = self.client.post("/api/flood_monitoring/cameras/", payload, format="json")
 
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("região canônica ativa", response.data["address"]["neighborhood_id"][0])
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["status"], "INACTIVE")
+        self.assertIsNone(response.data["region"])
+        camera = Camera.objects.select_related("address").get(pk=response.data["id"])
+        self.assertEqual(camera.neighborhood, unassigned)
+        self.assertEqual(camera.address.neighborhood, unassigned)
+        self.assertIsNone(camera.region)
+
+    def test_inactive_camera_without_region_cannot_become_operational(self):
+        unassigned = Neighborhood.objects.create(
+            name="Sem região",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+        self.client.force_authenticate(self.admin)
+
+        for index, target_status in enumerate(("ACTIVE", "OFFLINE"), start=1):
+            payload = self.camera_payload(
+                hls=f"https://cameras.example/regionless-{index}.m3u8"
+            )
+            payload["address"]["neighborhood_id"] = str(unassigned.id)
+            created = self.client.post(
+                "/api/flood_monitoring/cameras/", payload, format="json"
+            )
+
+            response = self.client.patch(
+                f"/api/flood_monitoring/cameras/{created.data['id']}/",
+                {"status": target_status},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(
+                response.data["status"],
+                [
+                    "A câmera precisa estar vinculada a uma região ativa da Base "
+                    "georreferenciada oficial antes da ativação."
+                ],
+            )
+
+    def test_regionless_camera_can_be_activated_with_valid_address_in_same_patch(self):
+        unassigned = Neighborhood.objects.create(
+            name="Sem região",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+        payload = self.camera_payload(hls="https://cameras.example/draft.m3u8")
+        payload["address"]["neighborhood_id"] = str(unassigned.id)
+        self.client.force_authenticate(self.admin)
+        created = self.client.post(
+            "/api/flood_monitoring/cameras/", payload, format="json"
+        )
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"status": "ACTIVE", "address": self.camera_payload()["address"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], "ACTIVE")
+        self.assertEqual(response.data["region"]["id"], str(self.region.id))
 
     def test_admin_creates_camera_with_canonical_address_reference_snapshot(self):
         dataset = GeodataDataset.objects.create(
@@ -599,6 +659,134 @@ class CameraMetadataApiTests(APITestCase):
         self.assertEqual(camera.latitude, address["latitude"])
         self.assertEqual(camera.longitude, address["longitude"])
         self.assertEqual(response.data["address"]["street"], address["street"])
+
+    def test_admin_patch_resolves_official_region_without_neighborhood(self):
+        boundary = MultiPolygon(
+            Polygon(((-49, -27), (-48, -27), (-48, -26), (-49, -26), (-49, -27))),
+            srid=4326,
+        )
+        self.city.geometry = boundary
+        self.city.save(update_fields=["geometry"])
+        self.region.geometry = boundary
+        self.region.save(update_fields=["geometry"])
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/official-region-only.m3u8"
+        )
+        address = self.camera_payload()["address"]
+        address.pop("neighborhood_id")
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"address": address},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["region"]["id"], str(self.region.id))
+        self.assertIsNone(response.data["neighborhood"])
+
+    def test_inactive_camera_can_update_to_regionless_address(self):
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/regionless-location.m3u8"
+        )
+        unassigned = Neighborhood.objects.create(
+            name="Sem região para edição",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+        address = self.camera_payload()["address"]
+        address["neighborhood_id"] = str(unassigned.id)
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"address": address},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["region"])
+        camera = Camera.objects.get(pk=created.data["id"])
+        self.assertEqual(camera.status, Camera.CameraStatus.INACTIVE)
+        self.assertIsNone(camera.region)
+
+    def test_operational_camera_with_region_cannot_move_to_regionless_address(self):
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/territorially-ready.m3u8"
+        )
+        activated = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"status": "ACTIVE"},
+            format="json",
+        )
+        self.assertEqual(activated.status_code, status.HTTP_200_OK)
+        unassigned = Neighborhood.objects.create(
+            name="Sem região operacional",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+        address = self.camera_payload()["address"]
+        address["neighborhood_id"] = str(unassigned.id)
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"address": address},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("coordinates", response.data["address"])
+
+    def test_legacy_operational_camera_without_region_remains_editable(self):
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/legacy-regionless.m3u8"
+        )
+        camera = Camera.objects.get(pk=created.data["id"])
+        camera.status = Camera.CameraStatus.ACTIVE
+        camera.region = None
+        camera.save(update_fields=["status", "region"])
+        self.neighborhood.region = None
+        self.neighborhood.save(update_fields=["region"])
+
+        edited = self.client.patch(
+            f"/api/flood_monitoring/cameras/{camera.id}/",
+            {"description": "Câmera legada revisada"},
+            format="json",
+        )
+        moved_offline = self.client.patch(
+            f"/api/flood_monitoring/cameras/{camera.id}/",
+            {"status": "OFFLINE"},
+            format="json",
+        )
+
+        self.assertEqual(edited.status_code, status.HTTP_200_OK)
+        self.assertEqual(moved_offline.status_code, status.HTTP_200_OK)
+        self.assertEqual(moved_offline.data["status"], "OFFLINE")
+
+    def test_legacy_regionless_camera_cannot_reactivate_after_becoming_inactive(self):
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/legacy-reactivation.m3u8"
+        )
+        camera = Camera.objects.get(pk=created.data["id"])
+        camera.status = Camera.CameraStatus.ACTIVE
+        camera.region = None
+        camera.save(update_fields=["status", "region"])
+        self.neighborhood.region = None
+        self.neighborhood.save(update_fields=["region"])
+
+        deactivated = self.client.patch(
+            f"/api/flood_monitoring/cameras/{camera.id}/",
+            {"status": "INACTIVE"},
+            format="json",
+        )
+        reactivated = self.client.patch(
+            f"/api/flood_monitoring/cameras/{camera.id}/",
+            {"status": "ACTIVE"},
+            format="json",
+        )
+
+        self.assertEqual(deactivated.status_code, status.HTTP_200_OK)
+        self.assertEqual(reactivated.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("status", reactivated.data)
 
     def test_offline_camera_keeps_playable_sources_but_exposes_no_preview_analysis(self):
         created = self.create_camera_as_admin()

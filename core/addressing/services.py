@@ -133,9 +133,15 @@ class TerritoryResolver:
             )
         city = cities[0]
         lookup_geometry = geometry if geometry.geom_type == "Point" else geometry.point_on_surface
-        region = Region.objects.filter(
+        regions = list(Region.objects.filter(
             is_active=True, city_ref=city, geometry__covers=lookup_geometry
-        ).order_by("id").first()
+        ).order_by("id")[:2])
+        if len(regions) > 1:
+            raise TerritoryResolutionError(
+                "territory_ambiguous",
+                "A geometria é coberta por mais de uma região oficial ativa.",
+            )
+        region = regions[0] if regions else None
         neighborhood = Neighborhood.objects.filter(
             is_active=True, city_ref=city, geometry__covers=lookup_geometry
         ).order_by("id").first()

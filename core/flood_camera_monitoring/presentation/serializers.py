@@ -54,6 +54,10 @@ class CameraAddressInputSerializer(RejectUnknownFieldsMixin, serializers.Seriali
     longitude = serializers.FloatField(min_value=-180.0, max_value=180.0)
 
 
+class CameraUpdateAddressInputSerializer(CameraAddressInputSerializer):
+    neighborhood_id = serializers.UUIDField(required=False, allow_null=True)
+
+
 class CameraCreateSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
     description = serializers.CharField(max_length=255, allow_blank=False)
     video_hls = serializers.URLField(max_length=512, allow_blank=False)
@@ -76,7 +80,7 @@ class CameraUpdateSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
     video_hls = serializers.URLField(max_length=512, required=False, allow_blank=False)
     video_embed = serializers.URLField(max_length=512, required=False, allow_blank=True, allow_null=True)
     status = serializers.ChoiceField(choices=Camera.CameraStatus.names, required=False)
-    address = CameraAddressInputSerializer(required=False)
+    address = CameraUpdateAddressInputSerializer(required=False)
 
     def validate_video_hls(self, value: str) -> str:
         normalized = normalize_hls_url(value)

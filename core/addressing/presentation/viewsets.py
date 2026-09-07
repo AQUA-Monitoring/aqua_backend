@@ -144,38 +144,41 @@ class AddressingViewSet(viewsets.ViewSet):
                 )
             city = city_ref.name
 
-        regions_qs = Region.objects.all()
+        regions_qs = Region.objects.filter(is_active=True)
+        neighborhoods_qs = Neighborhood.objects.filter(is_active=True).select_related(
+            "region"
+        )
         if city_ref:
             regions_qs = regions_qs.filter(
                 Q(city_ref_id=city_ref.id) | Q(city__iexact=city_ref.name)
             )
+            neighborhoods_qs = neighborhoods_qs.filter(
+                Q(city_ref_id=city_ref.id) | Q(city__iexact=city_ref.name)
+            )
         elif city:
             regions_qs = regions_qs.filter(city__iexact=city)
-        regions_qs = regions_qs.order_by("name").prefetch_related("neighborhoods")
+            neighborhoods_qs = neighborhoods_qs.filter(city__iexact=city)
+        regions_qs = regions_qs.order_by("normalized_name", "name")
+        neighborhoods = list(
+            neighborhoods_qs.order_by("normalized_name", "name", "id")
+        )
+        neighborhoods_by_region = {}
+        for neighborhood in neighborhoods:
+            if neighborhood.region_id:
+                neighborhoods_by_region.setdefault(neighborhood.region_id, []).append(
+                    neighborhood
+                )
 
         payload_regions = []
-        total_nb = 0
         for reg in regions_qs:
-            # Restrict neighborhoods to same city (defensive)
-            nbs = []
-            for nb in reg.neighborhoods.all():
-                if city_ref and not (
-                    nb.city_ref_id == city_ref.id
-                    or nb.city.strip().casefold() == city_ref.name.strip().casefold()
-                ):
-                    continue
-                if not city_ref and city and nb.city.strip().casefold() != city.strip().casefold():
-                    continue
-                nbs.append(nb)
-            nbs_sorted = sorted(nbs, key=lambda x: (x.name or ""))
-            total_nb += len(nbs_sorted)
+            nbs = neighborhoods_by_region.get(reg.id, [])
             payload_regions.append(
                 {
                     "id": str(reg.id),
                     "name": reg.name,
                     "city": reg.city,
                     "city_id": str(reg.city_ref_id or city_ref.id) if (reg.city_ref_id or city_ref) else None,
-                    "neighborhood_count": len(nbs_sorted),
+                    "neighborhood_count": len(nbs),
                     "neighborhoods": [
                         {
                             "id": str(nb.id),
@@ -188,8 +191,43 @@ class AddressingViewSet(viewsets.ViewSet):
                             ),
                             "region": {"id": str(reg.id), "name": reg.name},
                         }
-                        for nb in nbs_sorted
+                        for nb in nbs
                     ],
+                }
+            )
+
+        payload_neighborhoods = []
+        for neighborhood in neighborhoods:
+            expected_city_id = neighborhood.city_ref_id or (
+                city_ref.id if city_ref else None
+            )
+            region = neighborhood.region
+            canonical_region = (
+                region
+                if region
+                and region.is_active
+                and expected_city_id
+                and region.city_ref_id == expected_city_id
+                else None
+            )
+            payload_neighborhoods.append(
+                {
+                    "id": str(neighborhood.id),
+                    "name": neighborhood.name,
+                    "city": neighborhood.city,
+                    "city_id": (
+                        str(neighborhood.city_ref_id)
+                        if neighborhood.city_ref_id
+                        else None
+                    ),
+                    "region": (
+                        {
+                            "id": str(canonical_region.id),
+                            "name": canonical_region.name,
+                        }
+                        if canonical_region
+                        else None
+                    ),
                 }
             )
 
@@ -198,8 +236,9 @@ class AddressingViewSet(viewsets.ViewSet):
                 "city": city or None,
                 "city_id": str(city_ref.id) if city_ref else None,
                 "total_regions": len(payload_regions),
-                "total_neighborhoods": total_nb,
+                "total_neighborhoods": len(payload_neighborhoods),
                 "regions": payload_regions,
+                "neighborhoods": payload_neighborhoods,
             },
             status=status.HTTP_200_OK,
         )

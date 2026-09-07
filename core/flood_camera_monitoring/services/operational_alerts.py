@@ -46,6 +46,18 @@ class AlertConfirmation:
 PublicationCallback = Callable[[AlertPublication, str], None]
 
 
+def canonical_region_for_neighborhood(neighborhood, city):
+    """Return the neighborhood region only when it is active and city-safe."""
+
+    if neighborhood is None or city is None:
+        return None
+    region = getattr(neighborhood, "region", None)
+    city_id = getattr(city, "pk", city)
+    if region is None or not region.is_active or region.city_ref_id != city_id:
+        return None
+    return region
+
+
 def canonical_region_for_camera(camera):
     """Return one active, territorially consistent region for a camera."""
 
@@ -235,8 +247,8 @@ def confirm_operational_alert(
         canonical_region = canonical_region_for_camera(alert.camera)
         if canonical_region is None:
             raise AlertRegionRequired(
-                "Não foi possível confirmar: corrija a localização territorial da câmera "
-                "e associe-a a uma região canônica ativa."
+                "Localização territorial pendente. Revise a localização da câmera para "
+                "vinculá-la a uma região ativa da Base georreferenciada oficial."
             )
         if alert.region_id != canonical_region.id:
             alert.region = canonical_region

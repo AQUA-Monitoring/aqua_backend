@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 from django.test import TestCase, override_settings
+from django.contrib.gis.geos import Point
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -13,8 +14,8 @@ from core.flood_camera_monitoring.infra.models import (
 from core.users.infra.models import User
 
 from ..adapters import PushDeliveryError
-from ..models import PushDelivery, PushSubscription, RegionSubscription
-from ..services import deliver_push, fanout_alert
+from ..models import NotificationEvent, PushDelivery, PushSubscription, RegionSubscription, SavedPlace
+from ..services import deliver_push, fanout_alert, preview_event_audience, publish_event
 
 
 class NotificationFixture(TestCase):
@@ -212,6 +213,64 @@ class PushDeliveryServiceTests(NotificationFixture):
         delivery.refresh_from_db()
         self.assertEqual(delivery.status, PushDelivery.Status.FAILED)
         self.assertEqual(delivery.last_error, "falha temporária")
+
+
+class UnifiedNotificationApiTests(NotificationFixture):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+
+    def test_saved_places_are_private_and_radius_is_validated(self):
+        self.client.force_authenticate(self.user)
+        with patch("core.notifications.serializers.TerritoryResolver.resolve_point") as resolve:
+            resolve.return_value.city = self.city
+            resolve.return_value.region = self.region
+            resolve.return_value.neighborhood = None
+            created = self.client.post("/api/saved-places/", {
+                "name": "Casa", "latitude": -26.3, "longitude": -48.8, "radius_km": 3,
+            }, format="json")
+        self.assertEqual(created.status_code, 201)
+        self.client.force_authenticate(self.other_user)
+        self.assertEqual(self.client.get("/api/saved-places/").data["count"], 0)
+        invalid = self.client.post("/api/saved-places/", {
+            "name": "Longe", "latitude": -26.3, "longitude": -48.8, "radius_km": 25,
+        }, format="json")
+        self.assertEqual(invalid.status_code, 400)
+
+    @patch("core.notifications.tasks.deliver_push_batch_task.delay")
+    def test_manual_event_preview_and_publish_deduplicate_overlapping_preferences(self, delay):
+        RegionSubscription.objects.create(user=self.user, region=self.region)
+        PushSubscription.objects.create(user=self.user, endpoint="https://push.example.test/unified", p256dh="key", auth="auth")
+        self.client.force_authenticate(self.admin)
+        response = self.client.post("/api/notification-events/", {
+            "title": "Chuva intensa", "message": "Evite a região.", "severity": "CRITICAL",
+            "region_ids": [str(self.region.id)], "neighborhood_ids": [],
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+        event = NotificationEvent.objects.get(pk=response.data["id"])
+        self.assertEqual(preview_event_audience(event), {"users": 1, "devices": 1})
+        with self.captureOnCommitCallbacks(execute=True):
+            published = self.client.post(f"/api/notification-events/{event.id}/publish/")
+        self.assertEqual(published.status_code, 200)
+        self.assertEqual(PushDelivery.objects.filter(event=event).count(), 1)
+        delay.assert_called_once()
+
+    def test_standard_user_cannot_manage_manual_events(self):
+        self.client.force_authenticate(self.user)
+        self.assertEqual(self.client.get("/api/notification-events/").status_code, 403)
+
+    def test_saved_place_distance_respects_each_configured_radius(self):
+        farther_user = User.objects.create(name="Raio dez", email="radius-ten@example.test")
+        SavedPlace.objects.create(user=self.user, name="Raio 1", location=Point(-48.8, -26.3), radius_km=1, city=self.city)
+        SavedPlace.objects.create(user=self.other_user, name="Raio 3", location=Point(-48.78, -26.3), radius_km=3, city=self.city)
+        SavedPlace.objects.create(user=self.admin, name="Fora do raio", location=Point(-48.78, -26.3), radius_km=1, city=self.city)
+        SavedPlace.objects.create(user=farther_user, name="Raio 10", location=Point(-48.75, -26.3), radius_km=10, city=self.city)
+        event = NotificationEvent.objects.create(
+            origin="MANUAL", title="Teste", message="Teste", idempotency_key="distance:test",
+            geometry=Point(-48.8, -26.3),
+        )
+        event.regions.add(self.region)
+        self.assertEqual(preview_event_audience(event)["users"], 3)
 
 
 class OperationalAlertApiTests(NotificationFixture):

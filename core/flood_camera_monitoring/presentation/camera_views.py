@@ -32,6 +32,7 @@ from core.addressing.models import (
     City,
     GeodataDataset,
     Neighborhood,
+    Region,
     Street,
 )
 from core.addressing.geojson import point_inside_geometry
@@ -41,9 +42,11 @@ from core.flood_camera_monitoring.services.nearby import (
 )
 from core.flood_camera_monitoring.services.territorial_context import apply_camera_territorial_context
 from core.flood_camera_monitoring.services.operational_alerts import (
+    canonical_region_for_camera,
+    canonical_region_for_neighborhood,
     sync_active_alert_regions_for_camera,
 )
-from core.addressing.services import TerritoryResolutionError
+from core.addressing.services import TerritoryResolutionError, TerritoryResolver
 from core.flood_camera_monitoring.infra.models import (
     Camera,
     CameraOperationalSnapshot,
@@ -56,6 +59,10 @@ from core.common.cache import cache_delete
 
 
 PREDICT_ALL_CACHE_KEY = "flood:predict_all"
+CAMERA_ACTIVATION_REGION_ERROR = (
+    "A câmera precisa estar vinculada a uma região ativa da Base "
+    "georreferenciada oficial antes da ativação."
+)
 
 
 def _invalidate_predict_all_cache() -> None:
@@ -457,6 +464,126 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
             return Response({"detail": "Informe ao menos um campo para atualizar."}, status=status.HTTP_400_BAD_REQUEST)
 
         previous_status = camera.status
+        previous_region = canonical_region_for_camera(camera)
+        target_status = data.get("status", previous_status)
+        target_region = previous_region
+        address_city = None
+        address_neighborhood = None
+
+        address_data = data.get("address")
+        if address_data is not None:
+            required = {"city_id", "street", "latitude", "longitude"}
+            missing = sorted(required - set(address_data))
+            if missing:
+                return Response(
+                    {
+                        "address": {
+                            name: ["Campo obrigatório para alterar o endereço."]
+                            for name in missing
+                        }
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            address_city = City.objects.filter(pk=address_data["city_id"]).first()
+            if address_city is None:
+                return Response(
+                    {"address": {"city_id": ["Cidade não encontrada."]}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            submitted_neighborhood_id = address_data.get("neighborhood_id")
+            submitted_neighborhood = None
+            if submitted_neighborhood_id:
+                submitted_neighborhood = (
+                    Neighborhood.objects.select_related("region", "city_ref")
+                    .filter(pk=submitted_neighborhood_id, is_active=True)
+                    .first()
+                )
+            if submitted_neighborhood_id and (
+                submitted_neighborhood is None
+                or (
+                    submitted_neighborhood.city_ref_id
+                    and submitted_neighborhood.city_ref_id != address_city.id
+                )
+            ):
+                return Response(
+                    {
+                        "address": {
+                            "neighborhood_id": [
+                                "Bairro não encontrado ou incompatível com a cidade."
+                            ]
+                        }
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            official_regions_available = Region.objects.filter(
+                city_ref=address_city, is_active=True, geometry__isnull=False
+            ).exists()
+            if official_regions_available:
+                try:
+                    resolution = TerritoryResolver().resolve_point(
+                        Point(
+                            address_data["longitude"],
+                            address_data["latitude"],
+                            srid=4326,
+                        )
+                    )
+                except TerritoryResolutionError as exc:
+                    return Response(
+                        {"address": {"coordinates": [str(exc)]}},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if resolution.city.id != address_city.id:
+                    return Response(
+                        {"address": {"city_id": ["A coordenada não pertence à cidade informada."]}},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if (
+                    submitted_neighborhood
+                    and resolution.neighborhood
+                    and submitted_neighborhood.id != resolution.neighborhood.id
+                ):
+                    return Response(
+                        {"address": {"neighborhood_id": [
+                            "O bairro informado não corresponde à coordenada na Base georreferenciada oficial."
+                        ]}},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                address_neighborhood = resolution.neighborhood
+                target_region = resolution.region
+            else:
+                address_neighborhood = submitted_neighborhood
+                target_region = canonical_region_for_neighborhood(
+                    address_neighborhood, address_city
+                )
+
+        becoming_operational = (
+            previous_status == Camera.CameraStatus.INACTIVE
+            and target_status != Camera.CameraStatus.INACTIVE
+        )
+        degrading_operational_territory = (
+            previous_status != Camera.CameraStatus.INACTIVE
+            and target_status != Camera.CameraStatus.INACTIVE
+            and previous_region is not None
+            and target_region is None
+        )
+        if becoming_operational and target_region is None:
+            return Response(
+                {"status": [CAMERA_ACTIVATION_REGION_ERROR]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if degrading_operational_territory:
+            return Response(
+                {
+                    "address": {
+                        "coordinates": [
+                            "Uma câmera operacional vinculada à Base georreferenciada "
+                            "oficial não pode ser movida para um ponto sem região oficial ativa."
+                        ]
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         with transaction.atomic():
             if "video_hls" in data:
                 existing_streams = Camera.objects.select_for_update().exclude(pk=camera.pk).exclude(video_hls__isnull=True).exclude(video_hls="")
@@ -467,29 +594,9 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
                 if field in data:
                     setattr(camera, field, data[field])
 
-            address_data = data.get("address")
             if address_data is not None:
-                required = {"city_id", "neighborhood_id", "street", "latitude", "longitude"}
-                missing = sorted(required - set(address_data))
-                if missing:
-                    return Response({"address": {name: ["Campo obrigatório para alterar o endereço."] for name in missing}}, status=status.HTTP_400_BAD_REQUEST)
-                city = City.objects.filter(pk=address_data["city_id"]).first()
-                neighborhood = Neighborhood.objects.select_related("region", "city_ref").filter(pk=address_data["neighborhood_id"]).first()
-                if city is None:
-                    return Response({"address": {"city_id": ["Cidade não encontrada."]}}, status=status.HTTP_400_BAD_REQUEST)
-                if neighborhood is None or (neighborhood.city_ref_id and neighborhood.city_ref_id != city.id):
-                    return Response({"address": {"neighborhood_id": ["Bairro não encontrado ou incompatível com a cidade."]}}, status=status.HTTP_400_BAD_REQUEST)
-                if (
-                    not neighborhood.region_id
-                    or not neighborhood.region.is_active
-                    or neighborhood.region.city_ref_id != city.id
-                ):
-                    return Response(
-                        {"address": {"neighborhood_id": [
-                            "O bairro precisa estar associado a uma região canônica ativa da cidade."
-                        ]}},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+                city = address_city
+                neighborhood = address_neighborhood
                 latitude, longitude = address_data["latitude"], address_data["longitude"]
                 if latitude == 0 and longitude == 0:
                     return Response({"address": {"coordinates": ["[0,0] não representa uma localização operacional resolvida."]}}, status=status.HTTP_400_BAD_REQUEST)
@@ -510,9 +617,11 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
                 try:
                     apply_camera_territorial_context(camera, latitude=latitude, longitude=longitude)
                 except TerritoryResolutionError:
-                    camera.city, camera.region = city, neighborhood.region
                     camera.street = camera.road_segment = camera.address_reference = None
                     camera.territory_resolution = {"method": "LEGACY_ADDRESS", "resolved": False}
+                camera.city = city
+                camera.region = target_region
+                camera.neighborhood = neighborhood
 
             camera.save()
             sync_active_alert_regions_for_camera(camera)
@@ -619,22 +728,6 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if (
-            not neighborhood.region_id
-            or not neighborhood.region.is_active
-            or neighborhood.region.city_ref_id != city.id
-        ):
-            return Response(
-                {
-                    "address": {
-                        "neighborhood_id": [
-                            "O bairro precisa estar associado a uma região canônica ativa da cidade."
-                        ]
-                    }
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         selected_street = None
         address_reference = None
         street_id = address_data.get("street_id")
@@ -923,10 +1016,12 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
                 # A validação legada de cidade/bairro permanece válida mesmo
                 # quando a nova base territorial ainda não foi carregada.
                 camera.city = city
-                camera.region = neighborhood.region
                 camera.street = selected_street
                 camera.address_reference = address_reference
                 camera.territory_resolution = {"method": "LEGACY_ADDRESS", "resolved": False}
+                camera.city = city
+                camera.region = canonical_region_for_neighborhood(neighborhood, city)
+                camera.neighborhood = neighborhood
             camera.save(update_fields=[
                 "city", "region", "neighborhood", "street", "road_segment",
                 "address_reference", "territory_resolution", "updated_at",

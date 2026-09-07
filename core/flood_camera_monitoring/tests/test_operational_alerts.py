@@ -180,7 +180,7 @@ class OperationalAlertDomainTests(TestCase):
         )
 
     def test_confirmation_repairs_region_from_camera_neighborhood(self):
-        city = City.objects.create(name="Joinville")
+        city, _ = City.objects.get_or_create(name="Joinville")
         self.region.city_ref = city
         self.region.save(update_fields=["city_ref"])
         neighborhood = Neighborhood.objects.create(
@@ -201,7 +201,7 @@ class OperationalAlertDomainTests(TestCase):
         )
 
     def test_confirmation_repairs_region_from_address_neighborhood(self):
-        city = City.objects.create(name="Joinville")
+        city, _ = City.objects.get_or_create(name="Joinville")
         self.region.city_ref = city
         self.region.save(update_fields=["city_ref"])
         neighborhood = Neighborhood.objects.create(
@@ -223,7 +223,7 @@ class OperationalAlertDomainTests(TestCase):
         self.assertEqual(result.alert.region, self.region)
 
     def test_confirmation_rejects_conflicting_territorial_regions(self):
-        city = City.objects.create(name="Joinville")
+        city, _ = City.objects.get_or_create(name="Joinville")
         self.region.city_ref = city
         self.region.save(update_fields=["city_ref"])
         other_region = Region.objects.create(

@@ -292,6 +292,7 @@ WEB_PUSH_ENABLED = os.getenv("WEB_PUSH_ENABLED", "0") == "1" and bool(
 WEB_PUSH_TTL_SECONDS = int(os.getenv("WEB_PUSH_TTL_SECONDS", "3600"))
 WEB_PUSH_MAX_ATTEMPTS = int(os.getenv("WEB_PUSH_MAX_ATTEMPTS", "5"))
 WEB_PUSH_RECOVERY_BATCH_SIZE = int(os.getenv("WEB_PUSH_RECOVERY_BATCH_SIZE", "100"))
+UNIFIED_NOTIFICATIONS_ENABLED = os.getenv("UNIFIED_NOTIFICATIONS_ENABLED", "1") == "1"
 
 # Only development services that explicitly opt into Flood Monitoring route
 # its work to the dedicated worker. Production retains the established queue.

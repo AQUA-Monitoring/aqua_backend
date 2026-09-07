@@ -25,6 +25,12 @@ METRICS_TOKEN = "metrics-test-token"
     INTERNAL_METRICS_TOKEN=METRICS_TOKEN,
 )
 class InternalMetricsTests(TestCase):
+    def setUp(self):
+        # Seed migrations create operational camera snapshots. Metrics tests
+        # need a controlled dataset so their exact cardinality assertions are
+        # independent from the production seed catalog.
+        CameraOperationalSnapshot.objects.all().delete()
+
     def authorization(self, token: str = METRICS_TOKEN) -> dict[str, str]:
         return {"HTTP_AUTHORIZATION": f"Bearer {token}"}
 

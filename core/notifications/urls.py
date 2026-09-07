@@ -1,6 +1,7 @@
 from django.urls import path
 
-from .views import OperationalAlertViewSet, PushSubscriptionViewSet, RegionSubscriptionViewSet
+from rest_framework.routers import DefaultRouter
+from .views import NotificationEventViewSet, OperationalAlertViewSet, PushSubscriptionViewSet, RegionSubscriptionViewSet, SavedPlaceViewSet
 
 
 region_list = RegionSubscriptionViewSet.as_view(
@@ -24,3 +25,8 @@ urlpatterns = [
     path("operational-alerts/<uuid:pk>/dismiss/", alert_dismiss, name="operational-alert-dismiss"),
     path("operational-alerts/<uuid:pk>/resolve/", alert_resolve, name="operational-alert-resolve"),
 ]
+
+router = DefaultRouter()
+router.register("saved-places", SavedPlaceViewSet, basename="saved-place")
+router.register("notification-events", NotificationEventViewSet, basename="notification-event")
+urlpatterns += router.urls

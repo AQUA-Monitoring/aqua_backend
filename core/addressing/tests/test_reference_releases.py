@@ -154,13 +154,20 @@ class ReferenceBaseReleaseTests(TestCase):
             justification="Teste de persistencia da autoridade", actor=self.admin,
         )
         reexported = canonicalize_reference_ids(build_payload())
-        self.assertEqual(original["cities"][0]["id"], reexported["cities"][0]["id"])
-        self.assertEqual(
-            reexported["cities"][0]["authority"], "autoridade municipal estavel"
+        reexported_city = next(
+            city for city in reexported["cities"]
+            if city["official_code"] == original["cities"][0]["official_code"]
         )
+        self.assertEqual(original["cities"][0]["id"], reexported_city["id"])
         self.assertEqual(
-            original["neighborhoods"][0]["id"], reexported["neighborhoods"][0]["id"],
+            reexported_city["authority"], "autoridade municipal estavel"
         )
+        reexported_neighborhood = next(
+            neighborhood for neighborhood in reexported["neighborhoods"]
+            if neighborhood["official_code"] == original["neighborhoods"][0]["official_code"]
+            and neighborhood["city_ref_id"] == reexported_city["id"]
+        )
+        self.assertEqual(original["neighborhoods"][0]["id"], reexported_neighborhood["id"])
 
     def test_rollback_deactivates_records_exclusive_to_current_release(self):
         first = self._neighborhood_payload(

@@ -4,16 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       release_ref:
-        description: Immutable commit SHA registered by Aqua Ops
+        description: Immutable commit SHA registered by Server Ops
         required: true
         type: string
       build_id:
-        description: Aqua Ops build UUID that will receive the CI result
+        description: Server Ops build UUID that will receive the CI result
         required: true
         type: string
 
 permissions:
   contents: read
+  packages: write
+  id-token: write
+  attestations: write
 
 concurrency:
   group: aqua-backend-release
@@ -21,7 +24,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: [self-hosted, linux, x64, aqua-builder]
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Checkout requested release
@@ -43,17 +46,24 @@ jobs:
           test "$sha" = "$requested_sha"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-      - name: Validate Aqua Ops callback configuration
+      - name: Validate Server Ops callback configuration
         env:
           BUILD_ID: ${{ inputs.build_id }}
-          CALLBACK_BASE_URL: ${{ vars.AQUA_OPS_CALLBACK_URL }}
-          CALLBACK_TOKEN: ${{ secrets.AQUA_OPS_CI_CALLBACK_TOKEN }}
+          CALLBACK_BASE_URL: ${{ vars.SERVER_OPS_CALLBACK_URL }}
+          CALLBACK_TOKEN: ${{ secrets.SERVER_OPS_CI_CALLBACK_TOKEN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.SERVER_OPS_CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.SERVER_OPS_CF_ACCESS_CLIENT_SECRET }}
         shell: bash
         run: |
           set -euo pipefail
           [[ "$BUILD_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
           test -n "$CALLBACK_BASE_URL"
           test -n "$CALLBACK_TOKEN"
+          test -n "$CF_ACCESS_CLIENT_ID"
+          test -n "$CF_ACCESS_CLIENT_SECRET"
+
+      - name: Configure Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build isolated backend test image
         env:
@@ -128,43 +138,43 @@ jobs:
       - name: Authenticate private registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ secrets.AQUA_REGISTRY_HOST }}
-          username: ${{ secrets.AQUA_REGISTRY_USERNAME }}
-          password: ${{ secrets.AQUA_REGISTRY_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build backend image
         env:
-          REGISTRY: ${{ secrets.AQUA_REGISTRY_HOST }}
+          REGISTRY: ghcr.io/aqua-monitoring
           SHA: ${{ steps.release.outputs.sha }}
-        run: docker build --pull --target full -f Dockerfile.slim -t "$REGISTRY/aqua-backend:$SHA" .
+        run: |
+          docker buildx build --pull --target full -f Dockerfile.slim \
+            --tag "$REGISTRY/aqua-backend:$SHA" \
+            --cache-from type=gha,scope=aqua-backend \
+            --cache-to type=gha,mode=max,scope=aqua-backend \
+            --sbom=true --provenance=mode=max --push \
+            --metadata-file backend-metadata.json .
 
       - name: Build demo image
         env:
-          REGISTRY: ${{ secrets.AQUA_REGISTRY_HOST }}
-          SHA: ${{ steps.release.outputs.sha }}
-        run: docker build --pull --target demo -f Dockerfile.slim -t "$REGISTRY/aqua-demo:$SHA" .
-
-      - name: Push images
-        env:
-          REGISTRY: ${{ secrets.AQUA_REGISTRY_HOST }}
+          REGISTRY: ghcr.io/aqua-monitoring
           SHA: ${{ steps.release.outputs.sha }}
         run: |
-          set -euo pipefail
-          docker push "$REGISTRY/aqua-backend:$SHA"
-          docker push "$REGISTRY/aqua-demo:$SHA"
+          docker buildx build --pull --target demo -f Dockerfile.slim \
+            --tag "$REGISTRY/aqua-demo:$SHA" \
+            --cache-from type=gha,scope=aqua-demo \
+            --cache-to type=gha,mode=max,scope=aqua-demo \
+            --sbom=true --provenance=mode=max --push \
+            --metadata-file demo-metadata.json .
 
       - name: Record digests
         id: digests
         env:
-          REGISTRY: ${{ secrets.AQUA_REGISTRY_HOST }}
           SHA: ${{ steps.release.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          backend_ref=$(docker image inspect "$REGISTRY/aqua-backend:$SHA" --format '{{index .RepoDigests 0}}')
-          demo_ref=$(docker image inspect "$REGISTRY/aqua-demo:$SHA" --format '{{index .RepoDigests 0}}')
-          backend_digest=${backend_ref##*@}
-          demo_digest=${demo_ref##*@}
+          backend_digest=$(jq -r '.["containerimage.digest"]' backend-metadata.json)
+          demo_digest=$(jq -r '.["containerimage.digest"]' demo-metadata.json)
           [[ "$backend_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$demo_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "backend_digest=$backend_digest" >> "$GITHUB_OUTPUT"
@@ -176,12 +186,14 @@ jobs:
             echo "Demo: $demo_digest"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Report result to Aqua Ops
+      - name: Report result to Server Ops
         if: ${{ always() }}
         env:
           BUILD_ID: ${{ inputs.build_id }}
-          CALLBACK_BASE_URL: ${{ vars.AQUA_OPS_CALLBACK_URL }}
-          CALLBACK_TOKEN: ${{ secrets.AQUA_OPS_CI_CALLBACK_TOKEN }}
+          CALLBACK_BASE_URL: ${{ vars.SERVER_OPS_CALLBACK_URL }}
+          CALLBACK_TOKEN: ${{ secrets.SERVER_OPS_CI_CALLBACK_TOKEN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.SERVER_OPS_CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.SERVER_OPS_CF_ACCESS_CLIENT_SECRET }}
           JOB_STATUS: ${{ job.status }}
           REQUESTED_SHA: ${{ inputs.release_ref }}
           RESOLVED_SHA: ${{ steps.release.outputs.sha }}
@@ -191,11 +203,11 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$CALLBACK_BASE_URL" || {
-            echo "AQUA_OPS_CALLBACK_URL is required" >&2
+            echo "SERVER_OPS_CALLBACK_URL is required" >&2
             exit 1
           }
           test -n "$CALLBACK_TOKEN" || {
-            echo "AQUA_OPS_CI_CALLBACK_TOKEN is required" >&2
+            echo "SERVER_OPS_CI_CALLBACK_TOKEN is required" >&2
             exit 1
           }
           [[ "$BUILD_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
@@ -209,15 +221,15 @@ jobs:
             [[ "$BACKEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
             [[ "$DEMO_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
             payload=$(printf \
-              '{"status":"%s","commit_sha":"%s","backend_digest":"%s","demo_digest":"%s"}' \
-              "$callback_status" "$RESOLVED_SHA" "$BACKEND_DIGEST" "$DEMO_DIGEST")
+              '{"status":"%s","commit_sha":"%s","backend_digest":"%s","demo_digest":"%s","workflow_run_id":"%s"}' \
+              "$callback_status" "$RESOLVED_SHA" "$BACKEND_DIGEST" "$DEMO_DIGEST" "$GITHUB_RUN_ID")
           else
             callback_status=FAILED
             callback_sha=${RESOLVED_SHA:-${REQUESTED_SHA,,}}
             [[ "$callback_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]
             payload=$(printf \
-              '{"status":"%s","commit_sha":"%s"}' \
-              "$callback_status" "$callback_sha")
+              '{"status":"%s","commit_sha":"%s","workflow_run_id":"%s"}' \
+              "$callback_status" "$callback_sha" "$GITHUB_RUN_ID")
           fi
 
           callback_url="${CALLBACK_BASE_URL%/}/internal/v1/ci/builds/${BUILD_ID}/"
@@ -225,6 +237,8 @@ jobs:
             --retry 3 --retry-delay 2 --retry-all-errors --max-time 30 \
             --request POST \
             --header "Authorization: Bearer $CALLBACK_TOKEN" \
+            --header "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+            --header "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
             --header "Content-Type: application/json" \
             --data "$payload" \
             "$callback_url"

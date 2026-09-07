@@ -1,8 +1,12 @@
 from rest_framework import serializers
 
-from core.addressing.models import Region
+import uuid
 
-from .models import PushDelivery, PushSubscription, RegionSubscription
+from django.contrib.gis.geos import Point
+from core.addressing.models import Neighborhood, Region
+from core.addressing.services import TerritoryResolutionError, TerritoryResolver
+
+from .models import NotificationEvent, NotificationEventAudit, PushDelivery, PushSubscription, RegionSubscription, SavedPlace
 
 
 class RegionSummarySerializer(serializers.ModelSerializer):
@@ -25,17 +29,141 @@ class RegionSubscriptionSerializer(serializers.ModelSerializer):
         source="region", queryset=Region.objects.filter(is_active=True), write_only=True
     )
     region = RegionSummarySerializer(read_only=True)
+    neighborhood_id = serializers.PrimaryKeyRelatedField(
+        source="neighborhood", queryset=Neighborhood.objects.filter(is_active=True),
+        write_only=True, required=False,
+    )
+    neighborhood = serializers.SerializerMethodField()
 
     class Meta:
         model = RegionSubscription
-        fields = ("id", "region_id", "region", "created_at")
+        fields = ("id", "region_id", "region", "neighborhood_id", "neighborhood", "created_at")
         read_only_fields = ("id", "created_at")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["region_id"].required = False
+
+    def validate(self, attrs):
+        if bool(attrs.get("region")) == bool(attrs.get("neighborhood")):
+            raise serializers.ValidationError("Informe exatamente uma região ou bairro.")
+        return attrs
+
+    @staticmethod
+    def get_neighborhood(instance):
+        item = instance.neighborhood
+        if not item:
+            return None
+        return {"id": str(item.id), "name": item.name, "city": item.city,
+                "region_id": str(item.region_id) if item.region_id else None}
 
 
 class RegionSubscriptionDeleteSerializer(serializers.Serializer):
     region_id = serializers.PrimaryKeyRelatedField(
         source="region", queryset=Region.objects.all()
     )
+    neighborhood_id = serializers.PrimaryKeyRelatedField(
+        source="neighborhood", queryset=Neighborhood.objects.all(), required=False
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["region_id"].required = False
+
+    def validate(self, attrs):
+        if bool(attrs.get("region")) == bool(attrs.get("neighborhood")):
+            raise serializers.ValidationError("Informe exatamente uma região ou bairro.")
+        return attrs
+
+
+class SavedPlaceSerializer(serializers.ModelSerializer):
+    latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
+    longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
+    territory = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = SavedPlace
+        fields = ("id", "name", "latitude", "longitude", "radius_km", "territory", "created_at", "updated_at")
+        read_only_fields = ("id", "territory", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        latitude = attrs.pop("latitude", None)
+        longitude = attrs.pop("longitude", None)
+        if self.instance is None and (latitude is None or longitude is None):
+            raise serializers.ValidationError({"location": "Latitude e longitude são obrigatórias."})
+        if (latitude is None) != (longitude is None):
+            raise serializers.ValidationError({"location": "Informe latitude e longitude juntas."})
+        if latitude is None:
+            return attrs
+        point = Point(longitude, latitude, srid=4326)
+        try:
+            resolution = TerritoryResolver().resolve_point(point)
+        except TerritoryResolutionError as exc:
+            raise serializers.ValidationError({"location": str(exc)}) from exc
+        attrs.update(location=point, city=resolution.city, region=resolution.region,
+                     neighborhood=resolution.neighborhood)
+        return attrs
+
+    @staticmethod
+    def get_territory(instance):
+        return {
+            "city": instance.city.name if instance.city else None,
+            "region": instance.region.name if instance.region else None,
+            "neighborhood": instance.neighborhood.name if instance.neighborhood else None,
+        }
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["latitude"] = instance.location.y
+        data["longitude"] = instance.location.x
+        return data
+
+
+class NotificationEventSerializer(serializers.ModelSerializer):
+    region_ids = serializers.PrimaryKeyRelatedField(source="regions", many=True, queryset=Region.objects.filter(is_active=True), write_only=True, required=False)
+    neighborhood_ids = serializers.PrimaryKeyRelatedField(source="neighborhoods", many=True, queryset=Neighborhood.objects.filter(is_active=True), write_only=True, required=False)
+    regions = RegionSummarySerializer(many=True, read_only=True)
+    neighborhoods = serializers.SerializerMethodField()
+    delivery_summary = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NotificationEvent
+        fields = ("id", "origin", "status", "severity", "title", "message", "destination_url",
+                  "region_ids", "neighborhood_ids", "regions", "neighborhoods", "audience_count",
+                  "delivery_summary", "created_at", "published_at", "resolved_at")
+        read_only_fields = ("id", "origin", "status", "audience_count", "created_at", "published_at", "resolved_at")
+
+    def validate(self, attrs):
+        regions = attrs.get("regions", getattr(self.instance, "regions", []).all() if self.instance else [])
+        neighborhoods = attrs.get("neighborhoods", getattr(self.instance, "neighborhoods", []).all() if self.instance else [])
+        if not regions and not neighborhoods:
+            raise serializers.ValidationError("Informe ao menos uma região ou bairro.")
+        return attrs
+
+    def create(self, validated_data):
+        regions = validated_data.pop("regions", [])
+        neighborhoods = validated_data.pop("neighborhoods", [])
+        validated_data.update(origin=NotificationEvent.Origin.MANUAL,
+                              actor=self.context["request"].user,
+                              idempotency_key=f"manual:{uuid.uuid4()}")
+        event = super().create(validated_data)
+        event.regions.set(regions)
+        event.neighborhoods.set(neighborhoods)
+        NotificationEventAudit.objects.create(
+            event=event, action="CREATED", actor=self.context["request"].user
+        )
+        return event
+
+    @staticmethod
+    def get_neighborhoods(instance):
+        return [{"id": str(item.id), "name": item.name, "city": item.city} for item in instance.neighborhoods.all()]
+
+    @staticmethod
+    def get_delivery_summary(instance):
+        counts = {key: 0 for key in ("pending", "sent", "failed", "expired")}
+        for status in instance.push_deliveries.values_list("status", flat=True):
+            counts[status] = counts.get(status, 0) + 1
+        return counts
 
 
 class PushSubscriptionSerializer(serializers.ModelSerializer):

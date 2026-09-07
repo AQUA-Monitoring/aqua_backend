@@ -372,6 +372,13 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
         sync_legacy_spatial_event(
             instance, author=getattr(self.context.get("request"), "user", None)
         )
+        actor = getattr(self.context.get("request"), "user", None)
+        from django.conf import settings
+        if settings.UNIFIED_NOTIFICATIONS_ENABLED:
+            from core.notifications.services import create_flood_point_event, publish_event
+
+            event = create_flood_point_event(instance, actor=actor)
+            publish_event(event, actor=actor)
         return instance
 
     @transaction.atomic

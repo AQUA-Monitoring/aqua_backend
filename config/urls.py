@@ -52,6 +52,7 @@ urlpatterns = [
     path("api/occurrences/", include("core.occurrences.presentation.urls")),
     path("api/upload/", include(uploader_router.urls)),
     path("api/addressing/", include("core.addressing.presentation.urls")),
+    path("api/flood-impact/", include("core.flood_impact.urls")),
     path("api/donate/", include("core.donate.presentation.urls")),
     path(
         "api/floods_point/", include("core.flood_point_registering.presentation.urls")

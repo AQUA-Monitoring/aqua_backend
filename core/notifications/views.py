@@ -8,7 +8,7 @@ from rest_framework.response import Response
 
 from core.users.permissions import IsAppAdmin
 
-from .models import PushSubscription, RegionSubscription
+from .models import NotificationEvent, NotificationEventAudit, PushSubscription, RegionSubscription, SavedPlace
 from .serializers import (
     PushSubscriptionDeleteSerializer,
     PushSubscriptionSerializer,
@@ -17,8 +17,10 @@ from .serializers import (
     OperationalAlertFilterSerializer,
     ReasonSerializer,
     ResolveSerializer,
+    NotificationEventSerializer,
+    SavedPlaceSerializer,
 )
-from .services import schedule_publication_push
+from .services import preview_event_audience, publish_event, schedule_publication_push
 from core.flood_camera_monitoring.services.operational_alerts import canonical_region_for_camera
 
 
@@ -38,9 +40,8 @@ class RegionSubscriptionViewSet(viewsets.ViewSet):
     def create(self, request):
         serializer = RegionSubscriptionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        subscription, created = RegionSubscription.objects.get_or_create(
-            user=request.user, region=serializer.validated_data["region"]
-        )
+        values = {key: serializer.validated_data[key] for key in ("region", "neighborhood") if serializer.validated_data.get(key)}
+        subscription, created = RegionSubscription.objects.get_or_create(user=request.user, **values)
         output = RegionSubscriptionSerializer(subscription)
         return Response(
             output.data,
@@ -50,11 +51,70 @@ class RegionSubscriptionViewSet(viewsets.ViewSet):
     def destroy_collection(self, request):
         serializer = RegionSubscriptionDeleteSerializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
-        RegionSubscription.objects.filter(
-            user=request.user,
-            region=serializer.validated_data["region"],
-        ).delete()
+        values = {key: serializer.validated_data[key] for key in ("region", "neighborhood") if serializer.validated_data.get(key)}
+        RegionSubscription.objects.filter(user=request.user, **values).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SavedPlaceViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated]
+    serializer_class = SavedPlaceSerializer
+
+    def get_queryset(self):
+        return SavedPlace.objects.filter(user=self.request.user).select_related("city", "region", "neighborhood")
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+
+class NotificationEventViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, IsAppAdmin]
+    serializer_class = NotificationEventSerializer
+
+    def get_queryset(self):
+        queryset = NotificationEvent.objects.select_related("actor").prefetch_related("regions__city_ref", "neighborhoods", "push_deliveries")
+        for field in ("origin", "status", "severity"):
+            if self.request.query_params.get(field):
+                queryset = queryset.filter(**{field: self.request.query_params[field]})
+        if self.request.query_params.get("date_from"):
+            queryset = queryset.filter(created_at__gte=self.request.query_params["date_from"])
+        if self.request.query_params.get("date_to"):
+            queryset = queryset.filter(created_at__lte=self.request.query_params["date_to"])
+        return queryset
+
+    def destroy(self, request, *args, **kwargs):
+        event = self.get_object()
+        if event.status != NotificationEvent.Status.DRAFT:
+            return Response({"detail": "Somente rascunhos podem ser excluídos."}, status=status.HTTP_409_CONFLICT)
+        return super().destroy(request, *args, **kwargs)
+
+    def perform_update(self, serializer):
+        if serializer.instance.status != NotificationEvent.Status.DRAFT:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError("Somente rascunhos podem ser alterados.")
+        serializer.save()
+
+    @action(detail=True, methods=["get"])
+    def preview(self, request, pk=None):
+        return Response(preview_event_audience(self.get_object()))
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        try:
+            event = publish_event(self.get_object(), actor=request.user)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response(self.get_serializer(event).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        event = self.get_object()
+        if event.status != NotificationEvent.Status.DRAFT:
+            return Response({"detail": "Somente rascunhos podem ser cancelados."}, status=status.HTTP_409_CONFLICT)
+        event.status = NotificationEvent.Status.CANCELED
+        event.save(update_fields=["status", "updated_at"])
+        NotificationEventAudit.objects.create(event=event, action="CANCELED", actor=request.user)
+        return Response(self.get_serializer(event).data)
 
 
 class PushSubscriptionViewSet(viewsets.ViewSet):

@@ -1,8 +1,9 @@
-from django.contrib.gis.geos import MultiPolygon, Polygon
+from django.contrib.gis.geos import MultiPolygon, Point, Polygon
 from django.test import TestCase
 from rest_framework.test import APIClient
 
 from core.addressing.models import City, Neighborhood, Region
+from core.addressing.services import TerritoryResolutionError, TerritoryResolver
 from core.users.infra.models import User
 
 
@@ -31,3 +32,16 @@ class TerritoryResolutionApiTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["city"]["id"], str(self.city.id))
         self.assertEqual(response.data["neighborhood"]["id"], str(self.neighborhood.id))
+
+    def test_point_resolution_rejects_overlapping_active_regions(self):
+        Region.objects.create(
+            name="Outra região",
+            city=self.city.name,
+            city_ref=self.city,
+            geometry=self.city.geometry,
+        )
+
+        with self.assertRaises(TerritoryResolutionError) as caught:
+            TerritoryResolver().resolve_point(Point(-49.05, -26.25, srid=4326))
+
+        self.assertEqual(caught.exception.code, "territory_ambiguous")
