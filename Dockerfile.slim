@@ -26,6 +26,7 @@ FROM common AS base
 COPY manage.py ./
 COPY config ./config
 COPY core ./core
+COPY scripts ./scripts
 
 EXPOSE 8090
 
@@ -42,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && \
 COPY manage.py ./
 COPY config ./config
 COPY core ./core
+COPY scripts ./scripts
 COPY demo_assets/scenario.json /demo-assets/scenario.json
 
 ENV DJANGO_SETTINGS_MODULE=config.settings
@@ -65,6 +67,7 @@ FROM flood-dependencies AS flood
 COPY manage.py ./
 COPY config ./config
 COPY core ./core
+COPY scripts ./scripts
 
 EXPOSE 8091
 

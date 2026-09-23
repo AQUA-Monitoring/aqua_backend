@@ -74,22 +74,51 @@ class PostGISRoadImpactService:
 
     algorithm_version = "road-intersection-v1"
 
-    @transaction.atomic
-    def calculate(self, *, revision: FloodSpatialEventRevision, road_dataset: GeodataDataset) -> ImpactCalculationResult:
+    def calculate(
+        self, *, revision: FloodSpatialEventRevision, road_dataset: GeodataDataset,
+        reference_base_release=None, reason: str = "", requested_by=None,
+    ) -> ImpactCalculationResult:
         input_hash = hashlib.sha256(
             b"|".join([
                 bytes(revision.footprint.ewkb) if revision.footprint else b"no-footprint",
                 str(revision.id).encode(), road_dataset.sha256.encode(), self.algorithm_version.encode(),
+                str(getattr(reference_base_release, "id", "")).encode(),
             ])
         ).hexdigest()
-        run, created = RoadFloodImpactRun.objects.select_for_update().get_or_create(
+        completed = RoadFloodImpactRun.objects.filter(
             revision=revision,
             road_dataset=road_dataset,
             algorithm_version=self.algorithm_version,
-            defaults={"status": RoadFloodImpactRun.Status.RUNNING, "started_at": timezone.now(), "input_hash": input_hash},
+            input_hash=input_hash,
+            status=RoadFloodImpactRun.Status.COMPLETED,
+        ).order_by("-finished_at").first()
+        if completed is not None:
+            return ImpactCalculationResult(run=completed, reused=True)
+
+        run = RoadFloodImpactRun.objects.create(
+            revision=revision, road_dataset=road_dataset,
+            algorithm_version=self.algorithm_version, input_hash=input_hash,
+            status=RoadFloodImpactRun.Status.QUEUED, started_at=timezone.now(),
+            reference_base_release=reference_base_release, reason=reason,
+            requested_by=requested_by,
         )
-        if not created and run.status == RoadFloodImpactRun.Status.COMPLETED:
-            return ImpactCalculationResult(run=run, reused=True)
+        try:
+            self._execute(run=run, revision=revision, road_dataset=road_dataset)
+            run.refresh_from_db()
+        except Exception as exc:  # noqa: BLE001 - a execução precisa deixar evidência persistida
+            run.refresh_from_db()
+            run.status = RoadFloodImpactRun.Status.FAILED
+            run.finished_at = timezone.now()
+            run.report = {
+                "reason": "calculation_failed",
+                "error_type": type(exc).__name__,
+            }
+            run.save(update_fields=["status", "finished_at", "report", "updated_at"])
+        return ImpactCalculationResult(run=run, reused=False)
+
+    @transaction.atomic
+    def _execute(self, *, run, revision, road_dataset):
+        run = RoadFloodImpactRun.objects.select_for_update().get(pk=run.pk)
 
         run.impacts.all().delete()
         run.hotspots.all().delete()
@@ -97,15 +126,16 @@ class PostGISRoadImpactService:
         run.started_at = timezone.now()
         run.finished_at = None
         run.report = {}
-        run.input_hash = input_hash
-        run.save(update_fields=["status", "started_at", "finished_at", "report", "input_hash", "updated_at"])
+        run.save(update_fields=[
+            "status", "started_at", "finished_at", "report", "updated_at",
+        ])
 
         if revision.footprint is None:
             run.status = RoadFloodImpactRun.Status.COMPLETED
             run.finished_at = timezone.now()
             run.report = {"candidate_segments": 0, "impacted_segments": 0, "touches": 0, "reason": "footprint_required"}
             run.save(update_fields=["status", "finished_at", "report", "updated_at"])
-            return ImpactCalculationResult(run=run, reused=False)
+            return
 
         candidates = RoadAxisSegment.objects.filter(
             dataset=road_dataset,
@@ -179,4 +209,4 @@ class PostGISRoadImpactService:
             "impacted_length_m": total_length,
         }
         run.save(update_fields=["status", "finished_at", "report", "updated_at"])
-        return ImpactCalculationResult(run=run, reused=False)
+        return

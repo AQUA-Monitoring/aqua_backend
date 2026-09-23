@@ -1,5 +1,6 @@
 from django.utils import timezone
 from rest_framework import serializers
+from rest_framework.exceptions import APIException
 from core.flood_point_registering.infra.models import Flood_Point_Register
 from core.addressing.models import City, Neighborhood
 from django.db import models, transaction
@@ -11,7 +12,34 @@ from core.addressing.services import (
     TerritoryResolver,
     parse_geometry,
 )
-from core.flood_point_registering.services import sync_legacy_spatial_event
+from core.addressing.reference_releases import lock_active_reference_release
+from core.flood_point_registering.services import (
+    current_reference_base_revision,
+    sync_flood_point_neighborhoods,
+    sync_legacy_spatial_event,
+)
+
+
+class ReferenceBaseChanged(APIException):
+    status_code = 409
+    default_code = "REFERENCE_BASE_CHANGED"
+    default_detail = "A base de referencia ativa mudou; atualize os dados territoriais."
+
+
+_MISSING = object()
+
+
+def _locked_reference_revision(requested_revision):
+    active = lock_active_reference_release()
+    active_revision = active.revision if active else None
+    if requested_revision is not _MISSING and requested_revision != active_revision:
+        raise ReferenceBaseChanged({
+            "code": "REFERENCE_BASE_CHANGED",
+            "detail": "A base de referencia ativa mudou; atualize os dados territoriais.",
+            "requested_revision": requested_revision,
+            "active_revision": active_revision,
+        })
+    return active_revision
 
 
 class FloodPointRegisterSerializer(serializers.ModelSerializer):
@@ -35,6 +63,11 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
     spatial_event_id = serializers.UUIDField(read_only=True)
     affected_regions = serializers.SerializerMethodField()
     affected_streets = serializers.SerializerMethodField()
+    primary_neighborhood = serializers.SerializerMethodField()
+    neighborhoods = serializers.SerializerMethodField()
+    reference_base_revision = serializers.CharField(
+        required=False, allow_null=True, allow_blank=False, write_only=True
+    )
 
     class Meta:
         model = Flood_Point_Register
@@ -54,6 +87,9 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
             "spatial_event_id",
             "affected_regions",
             "affected_streets",
+            "primary_neighborhood",
+            "neighborhoods",
+            "reference_base_revision",
         ]
         extra_kwargs = {
             "city": {"required": False},
@@ -119,12 +155,12 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
 
         # Default possibility if null/empty -> 0.0
         poss = mutable.get("possibility", None)
-        if poss in (None, ""):
+        if self.instance is None and poss in (None, ""):
             mutable["possibility"] = 0.0
 
         # Keep absent spatial evidence explicit; never invent a real-world point.
         props = mutable.get("props", None)
-        if props in (None, ""):
+        if self.instance is None and props in (None, ""):
             mutable["props"] = {
                 "type": "Feature",
                 "geometry": None,
@@ -161,6 +197,40 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
     def get_affected_streets(self, instance):
         return self._affected_snapshot(instance, "affected_streets")
 
+    def _neighborhood_impact(self, link):
+        neighborhood = link.neighborhood
+        return {
+            "id": str(neighborhood.id),
+            "name": neighborhood.name,
+            "city_id": str(neighborhood.city_ref_id or link.flood_point.city_id),
+            "region": ({"id": str(neighborhood.region_id), "name": neighborhood.region.name} if neighborhood.region_id else None),
+            "is_primary": link.is_primary,
+            "relation": link.relation,
+            "intersection_area_m2": link.intersection_area_m2,
+            "footprint_fraction": link.footprint_fraction,
+            "resolution_method": link.resolution_method,
+            "review_status": link.review_status,
+        }
+
+    def get_neighborhoods(self, instance):
+        links = instance.neighborhood_links.select_related("neighborhood__region").order_by("-is_primary", "-intersection_area_m2", "neighborhood__name", "neighborhood_id")
+        return [self._neighborhood_impact(link) for link in links]
+
+    def get_primary_neighborhood(self, instance):
+        link = instance.neighborhood_links.select_related("neighborhood__region").filter(is_primary=True).first()
+        return self._neighborhood_impact(link) if link else None
+
+    def _persisted_reference_base_revision(self, instance):
+        primary = instance.neighborhood_links.filter(is_primary=True).only(
+            "reference_base_revision"
+        ).first()
+        if primary:
+            return primary.reference_base_revision
+        first = instance.neighborhood_links.only("reference_base_revision").first()
+        if first:
+            return first.reference_base_revision
+        return current_reference_base_revision()
+
     def validate_possibility(self, value: float) -> float:
         # Accept probability in [0,1]. If 1<value<=100, interpret as percentage.
         v = float(value)
@@ -173,6 +243,21 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
         )
 
     def validate(self, attrs):
+        revision_provided = "reference_base_revision" in attrs
+        requested_revision = attrs.get("reference_base_revision")
+        if revision_provided:
+            active_revision = current_reference_base_revision()
+            if requested_revision != active_revision:
+                raise ReferenceBaseChanged({
+                    "code": "REFERENCE_BASE_CHANGED",
+                    "detail": "A base de referencia ativa mudou; atualize os dados territoriais.",
+                    "requested_revision": requested_revision,
+                    "active_revision": active_revision,
+                })
+        spatial_request = self.instance is None or bool(
+            {"city", "neighborhood", "location", "footprint"}
+            & set(getattr(self, "initial_data", {}))
+        )
         # Validate timestamps; created_at is handled by model auto_now_add
         created_at = attrs.get("created_at") or getattr(
             self.instance, "created_at", None
@@ -203,15 +288,23 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {"neighborhood": "neighborhood não pertence à cidade informada"}
                 )
+        current_location = getattr(self.instance, "location", None)
+        current_footprint = getattr(self.instance, "footprint", None)
         try:
-            location = parse_geometry(attrs.get("location"), expected="Point")
-            footprint = parse_geometry(attrs.get("footprint"), expected="MultiPolygon")
+            location = parse_geometry(
+                attrs["location"] if "location" in attrs else current_location,
+                expected="Point",
+            )
+            footprint = parse_geometry(
+                attrs["footprint"] if "footprint" in attrs else current_footprint,
+                expected="MultiPolygon",
+            )
         except TerritoryResolutionError as exc:
             raise serializers.ValidationError({"geometry": str(exc)}) from exc
 
         # Compatibilidade: aceite o ponto GeoJSON historicamente armazenado em
         # props, mas não altere o payload legado devolvido ao cliente.
-        if location is None:
+        if location is None and self.instance is None:
             props = attrs.get("props") or {}
             raw_geometry = props.get("geometry") if isinstance(props, dict) else None
             if isinstance(raw_geometry, dict) and raw_geometry.get("type") == "Point":
@@ -221,7 +314,7 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({"props": str(exc)}) from exc
 
         resolution = None
-        if location is not None or footprint is not None:
+        if spatial_request and (location is not None or footprint is not None):
             if location is not None and footprint is not None and not footprint.covers(location):
                 raise serializers.ValidationError(
                     {"geometry": "o ponto representativo deve pertencer à mancha informada"}
@@ -247,11 +340,22 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
                 "region_id": str(resolution.region.pk) if resolution.region else None,
                 "neighborhood_id": str(resolution.neighborhood.pk) if resolution.neighborhood else None,
             }
+            if revision_provided:
+                attrs["territory_resolution"]["reference_base_revision"] = requested_revision
+        elif revision_provided and spatial_request:
+            territory_resolution = dict(
+                attrs.get("territory_resolution")
+                or getattr(self.instance, "territory_resolution", {})
+            )
+            territory_resolution["reference_base_revision"] = requested_revision
+            attrs["territory_resolution"] = territory_resolution
         if not city and location is None and footprint is None:
             raise serializers.ValidationError({"city": "cidade ou geometria é obrigatória"})
-        attrs["location"] = location
-        attrs["footprint"] = footprint
-        if not attrs.get("neighborhood"):
+        if self.instance is None or "location" in attrs:
+            attrs["location"] = location
+        if self.instance is None or "footprint" in attrs:
+            attrs["footprint"] = footprint
+        if not (attrs.get("neighborhood") or getattr(self.instance, "neighborhood", None)):
             raise serializers.ValidationError(
                 {"neighborhood": "bairro informado ou resolvido pela geometria é obrigatório"}
             )
@@ -259,15 +363,49 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
+        reference_revision = validated_data.pop("reference_base_revision", _MISSING)
+        locked_revision = _locked_reference_revision(reference_revision)
         instance = super().create(validated_data)
+        sync_flood_point_neighborhoods(
+            instance, reference_base_revision=locked_revision
+        )
         sync_legacy_spatial_event(
             instance, author=getattr(self.context.get("request"), "user", None)
         )
+        actor = getattr(self.context.get("request"), "user", None)
+        from django.conf import settings
+        if settings.UNIFIED_NOTIFICATIONS_ENABLED:
+            from core.notifications.services import create_flood_point_event, publish_event
+
+            event = create_flood_point_event(instance, actor=actor)
+            publish_event(event, actor=actor)
         return instance
 
     @transaction.atomic
     def update(self, instance, validated_data):
+        reference_revision = validated_data.pop("reference_base_revision", _MISSING)
+        spatial_fields = {"city", "neighborhood", "location", "footprint"}
+
+        def changed(field):
+            if field not in validated_data:
+                return False
+            old = getattr(instance, field)
+            new = validated_data[field]
+            if field in {"city", "neighborhood"}:
+                return getattr(old, "pk", old) != getattr(new, "pk", new)
+            if old is None or new is None:
+                return old is not new
+            return not old.equals(new)
+
+        spatial_changed = any(changed(field) for field in spatial_fields)
+        locked_revision = None
+        if spatial_changed or reference_revision is not _MISSING:
+            locked_revision = _locked_reference_revision(reference_revision)
         instance = super().update(instance, validated_data)
+        if spatial_changed:
+            sync_flood_point_neighborhoods(
+                instance, reference_base_revision=locked_revision
+            )
         sync_legacy_spatial_event(
             instance, author=getattr(self.context.get("request"), "user", None)
         )
@@ -277,4 +415,5 @@ class FloodPointRegisterSerializer(serializers.ModelSerializer):
         data = super().to_representation(instance)
         data["location"] = json.loads(instance.location.geojson) if instance.location else None
         data["footprint"] = json.loads(instance.footprint.geojson) if instance.footprint else None
+        data["reference_base_revision"] = self._persisted_reference_base_revision(instance)
         return data

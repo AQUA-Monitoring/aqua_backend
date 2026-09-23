@@ -27,6 +27,14 @@ def _client() -> DemoStreamClient:
 
 def _public_payload(payload: dict[str, Any]) -> dict[str, Any]:
     output = dict(payload)
+    output.pop("sources", None)
+    source = output.get("source")
+    if isinstance(source, dict):
+        output["source"] = {
+            key: value
+            for key, value in source.items()
+            if key in {"type", "mode", "status"}
+        }
     segment = output.get("segment")
     if isinstance(segment, dict):
         output["segment"] = {
@@ -93,4 +101,8 @@ class DemoStateView(APIView):
             payload.get("demo_state"),
             payload.get("session_id"),
         )
+        from core.uploader.models import DemoVideoSource
+
+        DemoVideoSource.objects.exclude(mode=requested_state).update(active=False)
+        DemoVideoSource.objects.filter(mode=requested_state).update(active=True)
         return Response({"enabled": True, **_public_payload(payload)})

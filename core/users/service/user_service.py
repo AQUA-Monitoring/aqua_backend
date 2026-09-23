@@ -110,6 +110,7 @@ class UsersService:
             "name": user.name,
             "type": user.type,
             "email": user.email,
+            "is_superuser": user.is_superuser,
             "profile_picture_id": (
                 str(user.profile_picture.attachment_key)
                 if user.profile_picture

@@ -3,7 +3,7 @@ from types import ModuleType
 from unittest.mock import Mock, patch
 
 from django.db.models.deletion import ProtectedError
-from django.contrib.gis.geos import Point
+from django.contrib.gis.geos import MultiPolygon, Point, Polygon
 from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
@@ -22,6 +22,7 @@ from core.flood_camera_monitoring.infra.models import (
     Camera,
     CameraOperationalSnapshot,
 )
+from core.flood_camera_monitoring.presentation.serializers import CameraReadSerializer
 from core.users.infra.models import User
 
 
@@ -97,6 +98,93 @@ class CameraMetadataApiTests(APITestCase):
         self.assertEqual(snapshot.analysis_status, snapshot.AnalysisStatus.NOT_ANALYZED)
         self.assertEqual(snapshot.model_status, snapshot.ModelStatus.UNKNOWN)
         self.assertEqual(response.data["created_by"], {"id": str(self.admin.id)})
+
+    def test_camera_payload_prioritizes_canonical_region_over_legacy_location(self):
+        camera = Camera.objects.create(
+            status=Camera.CameraStatus.ACTIVE,
+            description="Câmera com região canônica",
+            region=self.region,
+        )
+
+        self.assertEqual(
+            CameraReadSerializer(camera).data["region"],
+            {"id": str(self.region.id), "name": self.region.name},
+        )
+
+    def test_camera_creation_allows_neighborhood_without_canonical_region_as_inactive(self):
+        unassigned = Neighborhood.objects.create(
+            name="Sem região",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+        payload = self.camera_payload()
+        payload["address"]["neighborhood_id"] = str(unassigned.id)
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.post("/api/flood_monitoring/cameras/", payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["status"], "INACTIVE")
+        self.assertIsNone(response.data["region"])
+        camera = Camera.objects.select_related("address").get(pk=response.data["id"])
+        self.assertEqual(camera.neighborhood, unassigned)
+        self.assertEqual(camera.address.neighborhood, unassigned)
+        self.assertIsNone(camera.region)
+
+    def test_inactive_camera_without_region_cannot_become_operational(self):
+        unassigned = Neighborhood.objects.create(
+            name="Sem região",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+        self.client.force_authenticate(self.admin)
+
+        for index, target_status in enumerate(("ACTIVE", "OFFLINE"), start=1):
+            payload = self.camera_payload(
+                hls=f"https://cameras.example/regionless-{index}.m3u8"
+            )
+            payload["address"]["neighborhood_id"] = str(unassigned.id)
+            created = self.client.post(
+                "/api/flood_monitoring/cameras/", payload, format="json"
+            )
+
+            response = self.client.patch(
+                f"/api/flood_monitoring/cameras/{created.data['id']}/",
+                {"status": target_status},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(
+                response.data["status"],
+                [
+                    "A câmera precisa estar vinculada a uma região ativa da Base "
+                    "georreferenciada oficial antes da ativação."
+                ],
+            )
+
+    def test_regionless_camera_can_be_activated_with_valid_address_in_same_patch(self):
+        unassigned = Neighborhood.objects.create(
+            name="Sem região",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+        payload = self.camera_payload(hls="https://cameras.example/draft.m3u8")
+        payload["address"]["neighborhood_id"] = str(unassigned.id)
+        self.client.force_authenticate(self.admin)
+        created = self.client.post(
+            "/api/flood_monitoring/cameras/", payload, format="json"
+        )
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"status": "ACTIVE", "address": self.camera_payload()["address"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], "ACTIVE")
+        self.assertEqual(response.data["region"]["id"], str(self.region.id))
 
     def test_admin_creates_camera_with_canonical_address_reference_snapshot(self):
         dataset = GeodataDataset.objects.create(
@@ -502,10 +590,322 @@ class CameraMetadataApiTests(APITestCase):
             detail.data["operational"]["stream"]["status"], "UNAVAILABLE"
         )
 
+    def test_admin_patch_accepts_named_status_and_offline_keeps_only_stream(self):
+        created = self.create_camera_as_admin()
+        camera = Camera.objects.get(pk=created.data["id"])
+        snapshot = camera.operational_snapshot
+        snapshot.stream_status = snapshot.StreamStatus.ONLINE
+        snapshot.analysis_status = snapshot.AnalysisStatus.AVAILABLE
+        snapshot.classification = snapshot.CameraClassification.FLOOD_INDICATION
+        snapshot.prob_normal, snapshot.prob_medium, snapshot.prob_flooded = 5, 5, 90
+        snapshot.confidence, snapshot.frames = 90, 3
+        snapshot.model_status, snapshot.model_version = snapshot.ModelStatus.READY, "model-v1"
+        snapshot.analyzed_at = timezone.now()
+        snapshot.save()
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{camera.id}/",
+            {"status": "OFFLINE", "video_embed": "https://cameras.example/embed"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], "OFFLINE")
+        self.assertEqual(response.data["video_hls"], "https://cameras.example/stream.m3u8")
+        self.assertEqual(response.data["video_embed"], "https://cameras.example/embed")
+        self.assertEqual(response.data["operational"]["analysis"]["status"], "NOT_ANALYZED")
+        self.assertIsNone(response.data["operational"]["analysis"]["probabilities"])
+        camera.refresh_from_db()
+        self.assertEqual(camera.status, Camera.CameraStatus.OFFLINE)
+
+    def test_only_admin_can_patch_camera_metadata(self):
+        created = self.create_camera_as_admin()
+        self.client.force_authenticate(self.standard)
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"status": "INACTIVE"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_patch_updates_camera_address_selected_on_map(self):
+        created = self.create_camera_as_admin()
+        camera = Camera.objects.get(pk=created.data["id"])
+        address = {
+            "city_id": str(self.city.id),
+            "neighborhood_id": str(self.neighborhood.id),
+            "street": "Rua selecionada no mapa",
+            "number": "250",
+            "state": "SC",
+            "country": "Brasil",
+            "zipcode": "89200-250",
+            "latitude": -26.286,
+            "longitude": -48.854,
+        }
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{camera.id}/",
+            {"address": address},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        camera.refresh_from_db()
+        camera.address.refresh_from_db()
+        self.assertEqual(camera.address.street, address["street"])
+        self.assertEqual(camera.address.neighborhood, self.neighborhood)
+        self.assertEqual(camera.latitude, address["latitude"])
+        self.assertEqual(camera.longitude, address["longitude"])
+        self.assertEqual(response.data["address"]["street"], address["street"])
+
+    def test_admin_patch_resolves_official_region_without_neighborhood(self):
+        boundary = MultiPolygon(
+            Polygon(((-49, -27), (-48, -27), (-48, -26), (-49, -26), (-49, -27))),
+            srid=4326,
+        )
+        self.city.geometry = boundary
+        self.city.save(update_fields=["geometry"])
+        self.region.geometry = boundary
+        self.region.save(update_fields=["geometry"])
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/official-region-only.m3u8"
+        )
+        address = self.camera_payload()["address"]
+        address.pop("neighborhood_id")
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"address": address},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["region"]["id"], str(self.region.id))
+        self.assertIsNone(response.data["neighborhood"])
+
+    def test_inactive_camera_can_update_to_regionless_address(self):
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/regionless-location.m3u8"
+        )
+        unassigned = Neighborhood.objects.create(
+            name="Sem região para edição",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+        address = self.camera_payload()["address"]
+        address["neighborhood_id"] = str(unassigned.id)
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"address": address},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["region"])
+        camera = Camera.objects.get(pk=created.data["id"])
+        self.assertEqual(camera.status, Camera.CameraStatus.INACTIVE)
+        self.assertIsNone(camera.region)
+
+    def test_operational_camera_with_region_cannot_move_to_regionless_address(self):
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/territorially-ready.m3u8"
+        )
+        activated = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"status": "ACTIVE"},
+            format="json",
+        )
+        self.assertEqual(activated.status_code, status.HTTP_200_OK)
+        unassigned = Neighborhood.objects.create(
+            name="Sem região operacional",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+        address = self.camera_payload()["address"]
+        address["neighborhood_id"] = str(unassigned.id)
+
+        response = self.client.patch(
+            f"/api/flood_monitoring/cameras/{created.data['id']}/",
+            {"address": address},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("coordinates", response.data["address"])
+
+    def test_legacy_operational_camera_without_region_remains_editable(self):
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/legacy-regionless.m3u8"
+        )
+        camera = Camera.objects.get(pk=created.data["id"])
+        camera.status = Camera.CameraStatus.ACTIVE
+        camera.region = None
+        camera.save(update_fields=["status", "region"])
+        self.neighborhood.region = None
+        self.neighborhood.save(update_fields=["region"])
+
+        edited = self.client.patch(
+            f"/api/flood_monitoring/cameras/{camera.id}/",
+            {"description": "Câmera legada revisada"},
+            format="json",
+        )
+        moved_offline = self.client.patch(
+            f"/api/flood_monitoring/cameras/{camera.id}/",
+            {"status": "OFFLINE"},
+            format="json",
+        )
+
+        self.assertEqual(edited.status_code, status.HTTP_200_OK)
+        self.assertEqual(moved_offline.status_code, status.HTTP_200_OK)
+        self.assertEqual(moved_offline.data["status"], "OFFLINE")
+
+    def test_legacy_regionless_camera_cannot_reactivate_after_becoming_inactive(self):
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/legacy-reactivation.m3u8"
+        )
+        camera = Camera.objects.get(pk=created.data["id"])
+        camera.status = Camera.CameraStatus.ACTIVE
+        camera.region = None
+        camera.save(update_fields=["status", "region"])
+        self.neighborhood.region = None
+        self.neighborhood.save(update_fields=["region"])
+
+        deactivated = self.client.patch(
+            f"/api/flood_monitoring/cameras/{camera.id}/",
+            {"status": "INACTIVE"},
+            format="json",
+        )
+        reactivated = self.client.patch(
+            f"/api/flood_monitoring/cameras/{camera.id}/",
+            {"status": "ACTIVE"},
+            format="json",
+        )
+
+        self.assertEqual(deactivated.status_code, status.HTTP_200_OK)
+        self.assertEqual(reactivated.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("status", reactivated.data)
+
+    def test_offline_camera_keeps_playable_sources_but_exposes_no_preview_analysis(self):
+        created = self.create_camera_as_admin()
+        camera = Camera.objects.get(pk=created.data["id"])
+        camera.status = Camera.CameraStatus.OFFLINE
+        camera.save(update_fields=["status"])
+
+        snapshot = camera.operational_snapshot
+        snapshot.analysis_status = snapshot.AnalysisStatus.AVAILABLE
+        snapshot.classification = snapshot.CameraClassification.FLOOD_INDICATION
+        snapshot.prob_normal, snapshot.prob_medium, snapshot.prob_flooded = 5, 5, 90
+        snapshot.confidence, snapshot.frames = 90, 3
+        snapshot.model_status, snapshot.model_version = snapshot.ModelStatus.READY, "model-v1"
+        snapshot.analyzed_at = timezone.now()
+        snapshot.save()
+
+        self.client.force_authenticate(user=None)
+        detail = self.client.get(f"/api/flood_monitoring/cameras/{camera.id}/")
+
+        self.assertEqual(detail.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail.data["status"], "OFFLINE")
+        self.assertEqual(
+            detail.data["video_hls"], "https://cameras.example/stream.m3u8"
+        )
+        self.assertEqual(detail.data["preview_url"], detail.data["video_hls"])
+        self.assertEqual(detail.data["operational"]["analysis"]["status"], "NOT_ANALYZED")
+        self.assertIsNone(detail.data["operational"]["analysis"]["probabilities"])
+
+    def test_public_paginated_list_includes_offline_as_active_without_analysis(self):
+        created = self.create_camera_as_admin(
+            hls="https://cameras.example/offline-list.m3u8"
+        )
+        offline = Camera.objects.get(pk=created.data["id"])
+        offline.status = Camera.CameraStatus.OFFLINE
+        offline.save(update_fields=["status"])
+        snapshot = offline.operational_snapshot
+        snapshot.analysis_status = snapshot.AnalysisStatus.AVAILABLE
+        snapshot.classification = snapshot.CameraClassification.FLOOD_INDICATION
+        snapshot.prob_normal, snapshot.prob_medium, snapshot.prob_flooded = 5, 5, 90
+        snapshot.confidence, snapshot.frames = 90, 3
+        snapshot.model_status, snapshot.model_version = snapshot.ModelStatus.READY, "old-model"
+        snapshot.analyzed_at = timezone.now()
+        snapshot.save()
+
+        self.client.force_authenticate(user=None)
+        response = self.client.get(
+            "/api/flood_monitoring/cameras/",
+            {
+                "administrative_status": "ACTIVE",
+                "analysis_status": "NOT_ANALYZED",
+                "search": offline.description,
+                "page_size": 1,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(response.data["count"], 1)
+        self.assertEqual(len(response.data["results"]), 1)
+        item = response.data["results"][0]
+        self.assertEqual(item["id"], str(offline.id))
+        self.assertEqual(item["status"], "OFFLINE")
+        self.assertEqual(item["administrative_status"], "ACTIVE")
+        self.assertEqual(item["preview_url"], offline.video_hls)
+        self.assertNotIn("video_hls", item)
+        self.assertNotIn("video_embed", item)
+        self.assertEqual(item["operational"]["analysis"]["status"], "NOT_ANALYZED")
+        self.assertIsNone(item["operational"]["analysis"]["classification"])
+        self.assertIsNone(item["operational"]["analysis"]["probabilities"])
+
+        classified = self.client.get(
+            "/api/flood_monitoring/cameras/",
+            {"classification": "FLOOD_INDICATION", "page_size": 100},
+        )
+        classified_ids = {item["id"] for item in classified.data["results"]}
+        self.assertNotIn(str(offline.id), classified_ids)
+
+    @patch("core.flood_camera_monitoring.presentation.camera_views.cache_delete")
+    def test_active_to_offline_invalidates_predict_all_cache(self, cache_delete):
+        created = self.create_camera_as_admin()
+        camera = Camera.objects.get(pk=created.data["id"])
+        camera.status = Camera.CameraStatus.ACTIVE
+        camera.save(update_fields=["status"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.patch(
+                f"/api/flood_monitoring/cameras/{camera.id}/",
+                {"status": "OFFLINE"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        cache_delete.assert_called_once_with("flood:predict_all")
+
+    @patch(
+        "core.flood_camera_monitoring.presentation.camera_views.cache_delete",
+        side_effect=RuntimeError("redis unavailable"),
+    )
+    def test_cache_failure_does_not_fail_active_to_offline_patch(self, cache_delete):
+        created = self.create_camera_as_admin()
+        camera = Camera.objects.get(pk=created.data["id"])
+        camera.status = Camera.CameraStatus.ACTIVE
+        camera.save(update_fields=["status"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.patch(
+                f"/api/flood_monitoring/cameras/{camera.id}/",
+                {"status": "OFFLINE"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        cache_delete.assert_called_once_with("flood:predict_all")
+
     @override_settings(FLOOD_ANALYSIS_STALE_SECONDS=600)
     def test_stale_preserves_valid_result_but_fallback_nulls_it(self):
         created = self.create_camera_as_admin()
         camera = Camera.objects.get(pk=created.data["id"])
+        camera.status = Camera.CameraStatus.ACTIVE
+        camera.save(update_fields=["status"])
         snapshot = camera.operational_snapshot
         snapshot.analysis_status = snapshot.AnalysisStatus.AVAILABLE
         snapshot.classification = snapshot.CameraClassification.FLOOD_INDICATION

@@ -6,7 +6,7 @@ from core.uploader.serializers import (
     ImageUploadSerializer,
     VideoUploadSerializer,
 )
-from core.users.permissions import IsAppAdmin
+from core.users.permissions import IsActiveSuperuser
 
 
 class CreateViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, viewsets.GenericViewSet):
@@ -31,4 +31,4 @@ class VideoUploadViewSet(CreateViewSet):
     parser_classes = [parsers.FormParser, parsers.MultiPartParser]
 
     def get_permissions(self):
-        return [permissions.IsAuthenticated(), IsAppAdmin()]
+        return [permissions.IsAuthenticated(), IsActiveSuperuser()]

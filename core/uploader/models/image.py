@@ -9,13 +9,20 @@ from core.uploader.helpers.files import SVG_XML_CONTENT_TYPES, get_content_type
 
 def image_file_path(image, filename: str) -> str:
     content_type = get_content_type(image.file)
+    source_suffix = Path(filename or getattr(image.file, "name", "")).suffix.lower()
     extension: str | None
-    if content_type in SVG_XML_CONTENT_TYPES:
+    if content_type == "image/svg+xml" or (
+        content_type in SVG_XML_CONTENT_TYPES and source_suffix == ".svg"
+    ):
         extension = ".svg"
+    elif source_suffix and content_type in {"text/plain", "application/octet-stream"}:
+        # Remote sync may receive a generic MIME from libmagic; retain the
+        # source extension so attachment URLs remain stable and meaningful.
+        extension = source_suffix
     else:
         extension = mimetypes.guess_extension(content_type or "")
     if not extension:
-        extension = Path(filename or getattr(image.file, "name", "")).suffix
+        extension = source_suffix
     if extension == ".jpe":
         extension = ".jpg"
     return f"images/{image.public_id}{extension or ''}"

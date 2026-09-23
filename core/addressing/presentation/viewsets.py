@@ -17,7 +17,7 @@ from django.db.models import Q
 from uuid import UUID
 
 from core.addressing.services import TerritoryResolutionError, TerritoryResolver, parse_geometry
-from core.addressing.models import AddressReference, City, GeodataDataset, Region, Neighborhood, RoadAxisSegment, Street
+from core.addressing.models import AddressReference, City, GeodataDataset, ReferenceBaseRelease, Region, Neighborhood, RoadAxisSegment, Street
 from core.addressing.geojson import feature_collection
 from core.users.infra.models import User
 from core.users.permissions import IsAppAdmin
@@ -93,7 +93,7 @@ class AddressingViewSet(viewsets.ViewSet):
     def cities(self, request):
         data = [
             {"id": str(city.id), "name": city.name}
-            for city in City.objects.all().order_by("name")
+            for city in City.objects.filter(is_active=True).order_by("name")
         ]
         return Response(
             {"count": len(data), "results": data}, status=status.HTTP_200_OK
@@ -144,38 +144,41 @@ class AddressingViewSet(viewsets.ViewSet):
                 )
             city = city_ref.name
 
-        regions_qs = Region.objects.all()
+        regions_qs = Region.objects.filter(is_active=True)
+        neighborhoods_qs = Neighborhood.objects.filter(is_active=True).select_related(
+            "region"
+        )
         if city_ref:
             regions_qs = regions_qs.filter(
                 Q(city_ref_id=city_ref.id) | Q(city__iexact=city_ref.name)
             )
+            neighborhoods_qs = neighborhoods_qs.filter(
+                Q(city_ref_id=city_ref.id) | Q(city__iexact=city_ref.name)
+            )
         elif city:
             regions_qs = regions_qs.filter(city__iexact=city)
-        regions_qs = regions_qs.order_by("name").prefetch_related("neighborhoods")
+            neighborhoods_qs = neighborhoods_qs.filter(city__iexact=city)
+        regions_qs = regions_qs.order_by("normalized_name", "name")
+        neighborhoods = list(
+            neighborhoods_qs.order_by("normalized_name", "name", "id")
+        )
+        neighborhoods_by_region = {}
+        for neighborhood in neighborhoods:
+            if neighborhood.region_id:
+                neighborhoods_by_region.setdefault(neighborhood.region_id, []).append(
+                    neighborhood
+                )
 
         payload_regions = []
-        total_nb = 0
         for reg in regions_qs:
-            # Restrict neighborhoods to same city (defensive)
-            nbs = []
-            for nb in reg.neighborhoods.all():
-                if city_ref and not (
-                    nb.city_ref_id == city_ref.id
-                    or nb.city.strip().casefold() == city_ref.name.strip().casefold()
-                ):
-                    continue
-                if not city_ref and city and nb.city.strip().casefold() != city.strip().casefold():
-                    continue
-                nbs.append(nb)
-            nbs_sorted = sorted(nbs, key=lambda x: (x.name or ""))
-            total_nb += len(nbs_sorted)
+            nbs = neighborhoods_by_region.get(reg.id, [])
             payload_regions.append(
                 {
                     "id": str(reg.id),
                     "name": reg.name,
                     "city": reg.city,
                     "city_id": str(reg.city_ref_id or city_ref.id) if (reg.city_ref_id or city_ref) else None,
-                    "neighborhood_count": len(nbs_sorted),
+                    "neighborhood_count": len(nbs),
                     "neighborhoods": [
                         {
                             "id": str(nb.id),
@@ -188,8 +191,43 @@ class AddressingViewSet(viewsets.ViewSet):
                             ),
                             "region": {"id": str(reg.id), "name": reg.name},
                         }
-                        for nb in nbs_sorted
+                        for nb in nbs
                     ],
+                }
+            )
+
+        payload_neighborhoods = []
+        for neighborhood in neighborhoods:
+            expected_city_id = neighborhood.city_ref_id or (
+                city_ref.id if city_ref else None
+            )
+            region = neighborhood.region
+            canonical_region = (
+                region
+                if region
+                and region.is_active
+                and expected_city_id
+                and region.city_ref_id == expected_city_id
+                else None
+            )
+            payload_neighborhoods.append(
+                {
+                    "id": str(neighborhood.id),
+                    "name": neighborhood.name,
+                    "city": neighborhood.city,
+                    "city_id": (
+                        str(neighborhood.city_ref_id)
+                        if neighborhood.city_ref_id
+                        else None
+                    ),
+                    "region": (
+                        {
+                            "id": str(canonical_region.id),
+                            "name": canonical_region.name,
+                        }
+                        if canonical_region
+                        else None
+                    ),
                 }
             )
 
@@ -198,8 +236,9 @@ class AddressingViewSet(viewsets.ViewSet):
                 "city": city or None,
                 "city_id": str(city_ref.id) if city_ref else None,
                 "total_regions": len(payload_regions),
-                "total_neighborhoods": total_nb,
+                "total_neighborhoods": len(payload_neighborhoods),
                 "regions": payload_regions,
+                "neighborhoods": payload_neighborhoods,
             },
             status=status.HTTP_200_OK,
         )
@@ -603,6 +642,200 @@ class AddressingViewSet(viewsets.ViewSet):
             payload = {"detail": output.getvalue().strip()}
         return Response(payload, status=status.HTTP_200_OK)
 
+
+class AddressingV2ViewSet(AddressingViewSet):
+    """Contrato v2 aditivo, com identidades explicitamente de referencia."""
+
+    def _revision(self):
+        return ReferenceBaseRelease.objects.filter(
+            status=ReferenceBaseRelease.Status.ACTIVE
+        ).values_list("revision", flat=True).first()
+
+    @staticmethod
+    def _source(dataset):
+        if not dataset:
+            return None
+        return {
+            "reference_dataset_id": str(dataset.id),
+            "authority": dataset.authority,
+            "edition": dataset.source_version,
+            "source_url": dataset.source_url,
+            "license": {"name": dataset.license_name, "url": dataset.license_url},
+        }
+
+    @classmethod
+    def _reference_metadata(cls, dataset=None, *, precision="exact", distance=None, classification="reference"):
+        source = cls._source(dataset)
+        return {
+            "classification": classification,
+            "precision": precision,
+            "distance_m": distance,
+            "source": source,
+            "provenance": source,
+        }
+
+    @staticmethod
+    def _translate_reference_params(request):
+        params = request.query_params.copy()
+        for reference_name, legacy_name in (
+            ("reference_city_id", "city_id"),
+            ("reference_neighborhood_id", "neighborhood_id"),
+            ("reference_street_id", "street_id"),
+        ):
+            if reference_name in params:
+                params[legacy_name] = params[reference_name]
+        request._request.GET = params
+        return request
+
+    def status(self, request):
+        release = ReferenceBaseRelease.objects.filter(
+            status=ReferenceBaseRelease.Status.ACTIVE
+        ).first()
+        return Response({
+            "reference_base_revision": release.revision if release else None,
+            "reference_base_status": release.status if release else "unavailable",
+            "reference_base_activated_at": release.promoted_at if release else None,
+            "reference_base_schema_version": release.schema_version if release else None,
+            "reference_base_archive_sha256": release.archive_sha256 if release else None,
+        })
+
+    def cities(self, request):
+        self._translate_reference_params(request)
+        response = super().cities(request)
+        revision = self._revision()
+        for item in response.data["results"]:
+            city_id = item.pop("id")
+            item["reference_city_id"] = city_id
+            item["reference_base_revision"] = revision
+            city = City.objects.select_related("geometry_dataset").filter(pk=city_id).first()
+            item.update(self._reference_metadata(city.geometry_dataset if city else None))
+        response.data["reference_base_revision"] = revision
+        return response
+
+    def territories(self, request):
+        self._translate_reference_params(request)
+        response = super().territories(request)
+        if response.status_code >= 400:
+            return response
+        revision = self._revision()
+        for feature in response.data["features"]:
+            props = feature["properties"]
+            props["reference_territory_id"] = props.pop("id")
+            props["reference_city_id"] = props.pop("city_id")
+            props["reference_region_id"] = props.pop("region_id")
+            props["reference_base_revision"] = revision
+            provenance = props.get("provenance")
+            props.update({
+                "classification": "reference", "precision": "boundary",
+                "distance_m": None,
+                "source": ({
+                    "reference_dataset_id": provenance.get("dataset_id"),
+                    "authority": provenance.get("authority"),
+                    "edition": provenance.get("source_version"),
+                    "source_url": provenance.get("source_url"),
+                    "license": provenance.get("license"),
+                } if provenance else None),
+            })
+        response.data["reference_base_revision"] = revision
+        return response
+
+    def streets(self, request):
+        self._translate_reference_params(request)
+        response = super().streets(request)
+        if response.status_code >= 400:
+            return response
+        revision = self._revision()
+        for item in response.data.get("results", []):
+            item["reference_street_id"] = item.pop("id")
+            item["reference_city_id"] = item.pop("city_id")
+            item["reference_dataset_id"] = item.pop("dataset_id")
+            item["reference_base_revision"] = revision
+            dataset = GeodataDataset.objects.filter(pk=item["reference_dataset_id"]).first()
+            item.update(self._reference_metadata(dataset))
+        response.data["reference_base_revision"] = revision
+        return response
+
+    def autocomplete(self, request):
+        self._translate_reference_params(request)
+        response = super().autocomplete(request)
+        if response.status_code >= 400:
+            return response
+        revision = self._revision()
+        for item in response.data.get("results", []):
+            identity = item.pop("id")
+            item["reference_address_id" if item.get("kind") == "address" else "reference_street_id"] = identity
+            for old, new in (("city_id", "reference_city_id"), ("neighborhood_id", "reference_neighborhood_id"), ("street_id", "reference_street_id"), ("dataset_id", "reference_dataset_id")):
+                if old in item:
+                    item[new] = item.pop(old)
+            item["reference_base_revision"] = revision
+            dataset = GeodataDataset.objects.filter(pk=item.get("reference_dataset_id")).first()
+            item.update(self._reference_metadata(dataset))
+        response.data["reference_base_revision"] = revision
+        return response
+
+    @staticmethod
+    def _reference_object(value, kind):
+        if value is None:
+            return None
+        value = dict(value)
+        value[f"reference_{kind}_id"] = value.pop("id")
+        return value
+
+    def resolve(self, request):
+        self._translate_reference_params(request)
+        response = super().resolve(request)
+        if response.status_code >= 400:
+            return response
+        data = response.data
+        data["city"] = self._reference_object(data.get("city"), "city")
+        data["neighborhood"] = self._reference_object(data.get("neighborhood"), "neighborhood")
+        data["region"] = self._reference_object(data.get("region"), "region")
+        address = data.get("nearest_address")
+        if address:
+            address["reference_address_id"] = address.pop("id")
+            for old, new in (("neighborhood_id", "reference_neighborhood_id"), ("street_id", "reference_street_id"), ("address_reference_id", "reference_address_id")):
+                if old in address: address[new] = address.pop(old)
+            reference = AddressReference.objects.select_related("dataset").filter(
+                pk=address["reference_address_id"]
+            ).first()
+            address.update(self._reference_metadata(
+                reference.dataset if reference else None,
+                precision="nearest", distance=address.get("distance"),
+                classification="approximate",
+            ))
+        data["reference_base_revision"] = self._revision()
+        return response
+
+    def resolve_area(self, request):
+        response = super().resolve_area(request)
+        if response.status_code >= 400:
+            return response
+        data = response.data
+        data["city"] = self._reference_object(data.get("city"), "city")
+        data["neighborhood"] = self._reference_object(data.get("neighborhood"), "neighborhood")
+        data["region"] = self._reference_object(data.get("region"), "region")
+        for item in data.get("neighborhoods", []):
+            item["reference_neighborhood_id"] = item.pop("id")
+            neighborhood = Neighborhood.objects.select_related("dataset").filter(
+                pk=item["reference_neighborhood_id"]
+            ).first()
+            item.update(self._reference_metadata(
+                neighborhood.dataset if neighborhood else None,
+                precision="intersection", distance=None,
+            ))
+            if item.get("region"):
+                item["region"] = self._reference_object(item["region"], "region")
+        primary = Neighborhood.objects.select_related("dataset").filter(
+            pk=(data.get("neighborhood") or {}).get("reference_neighborhood_id")
+        ).first()
+        data.update(self._reference_metadata(
+            primary.dataset if primary else None,
+            precision="footprint", distance=None,
+        ))
+        data["reference_base_revision"] = self._revision()
+        data["algorithm_version"] = "territorial-resolution-v2"
+        return response
+
     @action(detail=False, methods=["get"], url_path="datasets")
     def datasets(self, request):
         denied = self._require(request, admin=True)
@@ -636,3 +869,11 @@ class AddressingViewSet(viewsets.ViewSet):
             else: base.update({"city_id": str(o.city_id), "neighborhood_id": str(o.neighborhood_id) if o.neighborhood_id else None, "dataset_id": str(o.dataset_id), "source_record_id": o.source_record_id, "street_id": str(o.street_id) if o.street_id else None, "street": o.street_name, "number": o.number, "modifier": o.modifier, "address_type": o.address_type, "species": o.species, "complement": o.complement, "zipcode": o.zipcode, "location": json.loads(o.location.geojson), "properties": o.properties, "is_active": o.is_active})
             return base
         return self._paginate(request, qs, serialize)
+
+
+# Esses endpoints administrativos ja pertenciam ao contrato v1. A classe v2
+# foi adicionada no fim do modulo para manter suas rotas explicitas; preserve
+# os handlers historicos no viewset registrado pelo router legado.
+AddressingViewSet.datasets = AddressingV2ViewSet.datasets
+AddressingViewSet.reports = AddressingV2ViewSet.reports
+AddressingViewSet.snapshot = AddressingV2ViewSet.snapshot

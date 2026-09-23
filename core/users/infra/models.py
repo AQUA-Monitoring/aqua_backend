@@ -30,6 +30,9 @@ class User(models.Model):
     type = models.CharField(
         max_length=20, choices=UserType.choices, default=UserType.STANDARD
     )
+    is_active = models.BooleanField(default=True)
+    is_staff = models.BooleanField(default=False)
+    is_superuser = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

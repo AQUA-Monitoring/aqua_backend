@@ -6,9 +6,10 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from core.flood_camera_monitoring.demo.manifest import (
     ALLOWED_STATES,
@@ -36,32 +37,48 @@ class DemoStreamController:
         public_hls_url: str,
         internal_base_url: str,
         source_type: str = "scenario",
+        video_resolver: Callable[[str], Path] | None = None,
+        playlist_timeout_seconds: float = 10.0,
     ) -> None:
         self.scenario = scenario
         self.work_dir = Path(work_dir)
         self.normalized_dir = self.work_dir / "normalized"
-        self.hls_dir = self.work_dir / "hls"
+        self.sessions_dir = self.work_dir / "sessions"
+        self.hls_dir = self.sessions_dir / "uninitialized"
         self.public_hls_url = public_hls_url
         self.internal_base_url = internal_base_url.rstrip("/")
         self.source_type = source_type
+        self.video_resolver = video_resolver
+        self.playlist_timeout_seconds = playlist_timeout_seconds
         self.logger = logging.getLogger(__name__)
         self._lock = threading.RLock()
+        self._prepare_lock = threading.Lock()
         self._process: subprocess.Popen[bytes] | None = None
         self._log_handle = None
-        self._normalized: dict[DemoPhase, Path] = {}
+        self._normalized: dict[str, Path] = {}
+        self._sources: dict[str, dict[str, Any]] = {}
         self.state = "auto"
         self.session_id = ""
 
-    def initialize(self) -> dict[str, Any]:
+    def initialize(self, initial_state: str = "auto") -> dict[str, Any]:
         self._require_binary("ffmpeg")
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.normalized_dir.mkdir(parents=True, exist_ok=True)
-        self.hls_dir.mkdir(parents=True, exist_ok=True)
-        for index, phase in enumerate(self.scenario.phases):
-            output = self.normalized_dir / f"phase_{index:03d}.mp4"
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        for phase in self.scenario.phases:
+            state = phase.state
+            version = uuid.uuid4().hex
+            output = self.normalized_dir / state / version / "source.mp4"
+            output.parent.mkdir(parents=True, exist_ok=True)
             self._normalize_phase(phase, output)
-            self._normalized[phase] = output
-        return self.set_state("auto")
+            self._normalized[state] = output
+            self._sources[state] = {
+                "mode": state,
+                "status": "ready",
+                "version": version,
+                "attachment_key": None,
+            }
+        return self.set_state(initial_state)
 
     @staticmethod
     def _require_binary(name: str) -> None:
@@ -118,52 +135,17 @@ class DemoStreamController:
         if state not in ALLOWED_STATES:
             raise DemoStreamError(f"Unsupported demo state: {state}")
         with self._lock:
-            phases = self.scenario.phases_for_state(state)
-            self._stop_process()
-            source = self._build_source(state, phases)
-            self._clear_hls()
-            self.state = state
-            self.session_id = str(uuid.uuid4())
-            self._start_hls(source)
+            self.scenario.phase_for_state(state)
+            source = self._normalized.get(state)
+            if source is None:
+                raise DemoStreamError(f"Demo source for state '{state}' is not ready")
+            self._promote(state, source)
             return self.snapshot()
 
-    def _build_source(self, state: str, phases: tuple[DemoPhase, ...]) -> Path:
-        concat_file = self.work_dir / f"concat_{state}.txt"
-        concat_file.write_text(
-            "".join(f"file '{self._normalized[phase].as_posix()}'\n" for phase in phases),
-            encoding="utf-8",
-        )
-        source = self.work_dir / f"source_{state}.mp4"
-        self._run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(concat_file),
-                "-c",
-                "copy",
-                str(source),
-            ],
-            f"Could not build source for state '{state}'",
-        )
-        return source
-
-    def _clear_hls(self) -> None:
-        self.hls_dir.mkdir(parents=True, exist_ok=True)
-        for path in self.hls_dir.iterdir():
-            if path.is_file():
-                path.unlink()
-
-    def _start_hls(self, source: Path) -> None:
-        playlist = self.hls_dir / "playlist.m3u8"
-        segment_pattern = self.hls_dir / "seg_%09d.ts"
+    def _spawn_hls(self, source: Path, hls_dir: Path):
+        hls_dir.mkdir(parents=True, exist_ok=False)
+        playlist = hls_dir / "playlist.m3u8"
+        segment_pattern = hls_dir / "seg_%09d.ts"
         command = [
             "ffmpeg",
             "-hide_banner",
@@ -191,22 +173,33 @@ class DemoStreamController:
             str(segment_pattern),
             str(playlist),
         ]
-        self._log_handle = (self.work_dir / "ffmpeg.log").open("ab")
+        log_handle = (hls_dir / "ffmpeg.log").open("ab")
         try:
-            self._process = subprocess.Popen(
+            process = subprocess.Popen(
                 command,
-                stdout=self._log_handle,
-                stderr=self._log_handle,
+                stdout=log_handle,
+                stderr=log_handle,
                 start_new_session=True,
             )
         except Exception:
-            self._log_handle.close()
-            self._log_handle = None
+            log_handle.close()
             raise
+        return process, log_handle
 
-    def _stop_process(self) -> None:
-        process = self._process
-        self._process = None
+    def _wait_until_ready(self, process, playlist: Path) -> None:
+        deadline = time.monotonic() + self.playlist_timeout_seconds
+        while time.monotonic() < deadline:
+            if playlist.is_file() and playlist.stat().st_size > 0:
+                return
+            if process.poll() is not None:
+                raise DemoStreamError(
+                    "Candidate demo stream stopped before playlist was ready"
+                )
+            time.sleep(0.05)
+        raise DemoStreamError("Candidate demo stream playlist was not ready in time")
+
+    @staticmethod
+    def _stop_candidate(process, log_handle) -> None:
         if process is not None and process.poll() is None:
             try:
                 process.send_signal(signal.SIGTERM)
@@ -214,9 +207,82 @@ class DemoStreamController:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
-        if self._log_handle is not None:
-            self._log_handle.close()
-            self._log_handle = None
+        if log_handle is not None:
+            log_handle.close()
+
+    def _promote(self, state: str, source: Path) -> None:
+        session_id = str(uuid.uuid4())
+        candidate_dir = self.sessions_dir / session_id
+        process = log_handle = None
+        try:
+            process, log_handle = self._spawn_hls(source, candidate_dir)
+            self._wait_until_ready(process, candidate_dir / "playlist.m3u8")
+        except Exception:
+            self._stop_candidate(process, log_handle)
+            shutil.rmtree(candidate_dir, ignore_errors=True)
+            raise
+
+        old_process, old_log = self._process, self._log_handle
+        self._process, self._log_handle = process, log_handle
+        self.hls_dir = candidate_dir
+        self.state = state
+        self.session_id = session_id
+        self._stop_candidate(old_process, old_log)
+
+    def prepare_source(self, state: str, attachment_key: str) -> dict[str, Any]:
+        if state not in ALLOWED_STATES:
+            raise DemoStreamError(f"Unsupported demo state: {state}")
+        if self.video_resolver is None:
+            raise DemoStreamError("Demo video resolver is not configured")
+        version = uuid.uuid4().hex
+        source_status = {
+            "mode": state,
+            "status": "preparing",
+            "version": version,
+            "attachment_key": attachment_key,
+        }
+        with self._lock:
+            self._sources[state] = source_status
+        output = self.normalized_dir / state / version / "source.mp4"
+        output.parent.mkdir(parents=True, exist_ok=False)
+        try:
+            with self._prepare_lock:
+                source_path = self.video_resolver(attachment_key)
+                template = self.scenario.phase_for_state(state)
+                assert template is not None
+                phase = DemoPhase(
+                    template.name,
+                    source_path,
+                    template.label,
+                    template.duration_seconds,
+                )
+                self._normalize_phase(phase, output)
+                with self._lock:
+                    if self.state == state:
+                        self._promote(state, output)
+                    self._normalized[state] = output
+                    self._sources[state] = {**source_status, "status": "ready"}
+                    return self.snapshot()
+        except Exception as exc:
+            shutil.rmtree(output.parent, ignore_errors=True)
+            with self._lock:
+                self._sources[state] = {
+                    **source_status,
+                    "status": "error",
+                    "error": str(exc),
+                }
+            if isinstance(exc, DemoStreamError):
+                raise
+            raise DemoStreamError(
+                f"Could not prepare demo source for '{state}': {exc}"
+            ) from exc
+
+    def _stop_process(self) -> None:
+        process = self._process
+        log_handle = self._log_handle
+        self._process = None
+        self._log_handle = None
+        self._stop_candidate(process, log_handle)
 
     def close(self) -> None:
         with self._lock:
@@ -232,11 +298,12 @@ class DemoStreamController:
         if not found:
             return None
         sequence, path = found[-2] if len(found) > 1 else found[-1]
-        phase = self.scenario.phase_for_sequence(self.state, sequence)
+        phase = self.scenario.phase_for_state(self.state)
+        assert phase is not None
         return {
             "sequence": sequence,
             "phase": phase.name,
-            "expected_state": phase.label,
+            "expected_state": phase.label if self.state != "auto" else None,
             "internal_url": f"{self.internal_base_url}/hls/{path.name}",
         }
 
@@ -259,7 +326,14 @@ class DemoStreamController:
                 "demo_state": self.state,
                 "available_states": list(self.scenario.available_states),
                 "scenario": scenario_as_dict(self.scenario),
-                "source": {"type": self.source_type, "status": "resolved"},
+                "source": {
+                    "type": self.source_type,
+                    **self._sources.get(
+                        self.state,
+                        {"mode": self.state, "status": "unavailable"},
+                    ),
+                },
+                "sources": {key: dict(value) for key, value in self._sources.items()},
                 "current_phase": latest["phase"] if latest else None,
                 "hls_url": self.public_hls_url,
                 "segment": latest,

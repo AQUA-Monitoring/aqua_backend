@@ -25,6 +25,10 @@ class DemoPhase:
     label: str | None
     duration_seconds: int
 
+    @property
+    def state(self) -> str:
+        return self.label or "auto"
+
 
 @dataclass(frozen=True)
 class DemoScenario:
@@ -34,20 +38,29 @@ class DemoScenario:
 
     @property
     def available_states(self) -> tuple[str, ...]:
-        labels = {phase.label for phase in self.phases if phase.label is not None}
-        return ("auto",) + tuple(
-            state for state in ("normal", "flooded") if state in labels
+        return tuple(
+            state
+            for state in ("auto", "normal", "flooded")
+            if self.phase_for_state(state, required=False)
         )
 
-    def phases_for_state(self, state: str) -> tuple[DemoPhase, ...]:
+    def phase_for_state(self, state: str, *, required: bool = True) -> DemoPhase | None:
         if state not in ALLOWED_STATES:
             raise DemoManifestError(f"Unsupported demo state: {state}")
-        if state == "auto":
-            return self.phases
-        selected = tuple(phase for phase in self.phases if phase.label == state)
+        selected = tuple(phase for phase in self.phases if phase.state == state)
+        if len(selected) > 1:
+            raise DemoManifestError(
+                f"Scenario must define exactly one video for state '{state}'"
+            )
         if not selected:
-            raise DemoManifestError(f"Scenario has no phase for state '{state}'")
-        return selected
+            if required:
+                raise DemoManifestError(f"Scenario has no video for state '{state}'")
+            return None
+        return selected[0]
+
+    def phases_for_state(self, state: str) -> tuple[DemoPhase, ...]:
+        phase = self.phase_for_state(state)
+        return (phase,) if phase is not None else ()
 
     def phase_for_sequence(self, state: str, sequence: int) -> DemoPhase:
         if sequence < 0:
@@ -87,7 +100,17 @@ def _resolve_phase_video(
     phase: dict[str, Any],
     video_resolver: VideoResolver | None,
     require_uploader: bool = False,
+    override_attachment_key: str | None = None,
 ) -> Path:
+    if override_attachment_key is not None:
+        if video_resolver is None:
+            raise DemoManifestError(
+                "Uploader video overrides require a configured video resolver"
+            )
+        if not override_attachment_key.strip():
+            raise DemoManifestError("Video attachment key override cannot be empty")
+        return video_resolver(override_attachment_key.strip())
+
     file_value = phase.get("file")
     attachment_key = phase.get("video_attachment_key")
     attachment_key_env = phase.get("video_attachment_key_env")
@@ -138,6 +161,7 @@ def load_scenario(
     *,
     video_resolver: VideoResolver | None = None,
     require_uploader: bool = False,
+    state_video_keys: dict[str, str] | None = None,
 ) -> DemoScenario:
     manifest_path = Path(path)
     if not manifest_path.is_file():
@@ -192,23 +216,23 @@ def load_scenario(
                     phase,
                     video_resolver,
                     require_uploader=require_uploader,
+                    override_attachment_key=(state_video_keys or {}).get(
+                        label or "auto"
+                    ),
                 ),
                 label=label,
                 duration_seconds=duration,
             )
         )
 
-    labels = {phase.label for phase in phases if phase.label is not None}
-    if not labels.intersection({"normal", "flooded"}):
-        raise DemoManifestError(
-            "Scenario must include at least one normal or flooded phase"
-        )
-
-    return DemoScenario(
+    scenario = DemoScenario(
         scenario_id=scenario_id.strip(),
         phases=tuple(phases),
         segment_seconds=segment_seconds,
     )
+    for state in ("auto", "normal", "flooded"):
+        scenario.phase_for_state(state)
+    return scenario
 
 
 def scenario_as_dict(scenario: DemoScenario) -> dict[str, Any]:

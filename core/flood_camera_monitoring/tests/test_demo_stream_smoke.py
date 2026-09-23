@@ -12,9 +12,10 @@ from core.flood_camera_monitoring.demo.manifest import load_scenario
 
 @skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for the HLS smoke test")
 class DemoStreamSmokeTests(TestCase):
-    def test_generates_a_labeled_hls_playlist(self):
+    def test_generates_an_auto_hls_playlist(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
+            self._make_video(root / "auto.mp4", "green")
             self._make_video(root / "normal.mp4", "blue")
             self._make_video(root / "flooded.mp4", "red")
             manifest = root / "scenario.json"
@@ -24,6 +25,12 @@ class DemoStreamSmokeTests(TestCase):
                         "scenario_id": "smoke-test",
                         "segment_seconds": 2,
                         "phases": [
+                            {
+                                "name": "auto",
+                                "file": "auto.mp4",
+                                "label": None,
+                                "duration_seconds": 2,
+                            },
                             {
                                 "name": "normal",
                                 "file": "normal.mp4",
@@ -57,9 +64,7 @@ class DemoStreamSmokeTests(TestCase):
 
                 self.assertEqual(snapshot["status"], "ready")
                 self.assertTrue((controller.hls_dir / "playlist.m3u8").is_file())
-                self.assertIn(
-                    snapshot["segment"]["expected_state"], {"normal", "flooded"}
-                )
+                self.assertIsNone(snapshot["segment"]["expected_state"])
                 self.assertTrue(snapshot["segment"]["internal_url"].endswith(".ts"))
             finally:
                 controller.close()

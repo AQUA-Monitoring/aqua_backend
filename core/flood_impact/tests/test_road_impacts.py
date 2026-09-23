@@ -3,6 +3,7 @@ from django.apps import apps as django_apps
 from django.test import TestCase
 from django.utils import timezone
 from importlib import import_module
+from unittest.mock import patch
 from rest_framework.test import APIClient
 
 from core.addressing.models import City, GeodataDataset, RoadAxisSegment, Street
@@ -47,6 +48,34 @@ class RoadImpactServiceTests(TestCase):
         result = PostGISRoadImpactService().calculate(revision=self.revision(footprint), road_dataset=self.dataset)
         self.assertEqual(result.run.report["touches"], 1)
         self.assertEqual(RoadFloodImpact.objects.count(), 0)
+
+    def test_failed_and_nonterminal_runs_are_preserved_when_retrying(self):
+        footprint = MultiPolygon(Polygon(((0, 0), (1, 0), (1, 1), (0, 1), (0, 0))), srid=4326)
+        revision = self.revision(footprint)
+        service = PostGISRoadImpactService()
+        with patch.object(service, "_execute", side_effect=RuntimeError("sensitive database detail")):
+            failed = service.calculate(revision=revision, road_dataset=self.dataset)
+        self.assertEqual(failed.run.status, RoadFloodImpactRun.Status.FAILED)
+        self.assertEqual(failed.run.report["reason"], "calculation_failed")
+        self.assertNotIn("sensitive", str(failed.run.report))
+
+        running = RoadFloodImpactRun.objects.create(
+            revision=revision, road_dataset=self.dataset, algorithm_version=service.algorithm_version,
+            status=RoadFloodImpactRun.Status.RUNNING, started_at=timezone.now(), input_hash=failed.run.input_hash,
+        )
+        stale = RoadFloodImpactRun.objects.create(
+            revision=revision, road_dataset=self.dataset, algorithm_version=service.algorithm_version,
+            status=RoadFloodImpactRun.Status.STALE, started_at=timezone.now(), input_hash=failed.run.input_hash,
+        )
+        retried = service.calculate(revision=revision, road_dataset=self.dataset)
+        self.assertEqual(retried.run.status, RoadFloodImpactRun.Status.COMPLETED)
+        self.assertNotEqual(retried.run.pk, failed.run.pk)
+        failed.run.refresh_from_db()
+        running.refresh_from_db()
+        stale.refresh_from_db()
+        self.assertEqual(failed.run.status, RoadFloodImpactRun.Status.FAILED)
+        self.assertEqual(running.status, RoadFloodImpactRun.Status.RUNNING)
+        self.assertEqual(stale.status, RoadFloodImpactRun.Status.STALE)
 
     def test_hotspot_history_exposes_revision_affected_territory_snapshot(self):
         revision = self.revision(None)

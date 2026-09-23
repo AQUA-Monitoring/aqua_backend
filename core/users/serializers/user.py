@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from core.uploader.serializers.image import validate_image_file
+
 
 class UserSerializer(serializers.Serializer):
     id = serializers.UUIDField(read_only=True)
@@ -7,6 +9,7 @@ class UserSerializer(serializers.Serializer):
     email = serializers.EmailField()
     profile_picture = serializers.SerializerMethodField()
     profile_picture_id = serializers.SerializerMethodField()
+    is_superuser = serializers.BooleanField(read_only=True)
 
     @staticmethod
     def get_profile_picture(user):
@@ -26,12 +29,18 @@ class SignupSerializer(serializers.Serializer):
     profile_picture = serializers.FileField(required=False, allow_null=True)
     profile_picture_id = serializers.UUIDField(required=False, allow_null=True)
 
+    def validate_profile_picture(self, value):
+        return validate_image_file(value)
+
 
 class UpdateUserSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=100, required=False)
     email = serializers.EmailField(required=False)
     profile_picture = serializers.FileField(required=False, allow_null=True)
     profile_picture_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate_profile_picture(self, value):
+        return validate_image_file(value)
 
 
 class TokenPairSerializer(serializers.Serializer):

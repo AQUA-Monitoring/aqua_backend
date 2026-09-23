@@ -287,6 +287,7 @@ def snapshot_prediction_payload(
     camera,
     snapshot: CameraOperationalSnapshot | None,
 ) -> dict[str, Any]:
+    disabled_for_analysis = camera.status != camera.CameraStatus.ACTIVE
     if snapshot is None:
         analysis_status = CameraOperationalSnapshot.AnalysisStatus.NOT_ANALYZED
         classification = None
@@ -360,6 +361,23 @@ def snapshot_prediction_payload(
             probabilities = {"normal": None, "medium": None, "flooded": None}
             confidence = None
             frames = None
+
+    if disabled_for_analysis:
+        analysis_status = CameraOperationalSnapshot.AnalysisStatus.NOT_ANALYZED
+        classification = None
+        probabilities = {"normal": None, "medium": None, "flooded": None}
+        confidence = None
+        frames = None
+        model_status = CameraOperationalSnapshot.ModelStatus.UNKNOWN
+        model_version = analyzed_at = None
+        error_code = (
+            "CAMERA_OFFLINE"
+            if camera.status == camera.CameraStatus.OFFLINE
+            else "CAMERA_INACTIVE"
+        )
+        if camera.status == camera.CameraStatus.INACTIVE:
+            stream_status = CameraOperationalSnapshot.StreamStatus.UNKNOWN
+            stream_checked_at = None
 
     has_classification = classification is not None
     return {

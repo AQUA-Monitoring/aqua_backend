@@ -1,11 +1,11 @@
 from datetime import timedelta
 
-from django.contrib.auth import get_user_model
 from rest_framework import serializers
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.tokens import AccessToken
 
 from core.users.serializers.auth import SYNC_AUTH_MODEL, SYNC_SCOPE
+from core.users.infra.models import User
 
 
 SYNC_TOKEN_SECONDS = 3600
@@ -20,8 +20,7 @@ class SyncTokenSerializer(serializers.Serializer):
     def validate(self, attrs):
         email = attrs["email"].strip()
         password = attrs["password"]
-        DjangoUser = get_user_model()
-        users = DjangoUser.objects.filter(email__iexact=email)
+        users = User.objects.filter(email__iexact=email)
 
         if users.count() != 1:
             raise AuthenticationFailed(INVALID_CREDENTIALS)
@@ -36,7 +35,7 @@ class SyncTokenSerializer(serializers.Serializer):
 
         token = AccessToken()
         token.set_exp(lifetime=SYNC_TOKEN_LIFETIME)
-        token["user_id"] = user.pk
+        token["user_id"] = str(user.pk)
         token["scope"] = SYNC_SCOPE
         token["auth_model"] = SYNC_AUTH_MODEL
         return {

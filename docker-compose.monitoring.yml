@@ -1,0 +1,43 @@
+# Opt-in operational rollout. Apply migrations before enabling the dispatcher.
+services:
+  web:
+    environment:
+      FLOOD_ADAPTIVE_ENABLED: "1"
+    volumes:
+      - private_evidence:/app/private_flood_evidence
+      - private_models:/app/private_flood_models
+  worker:
+    environment:
+      FLOOD_ADAPTIVE_ENABLED: "1"
+    command: ["python", "-m", "celery", "-A", "config", "worker", "-l", "info", "-Q", "celery,flood_regular", "--concurrency=2", "--prefetch-multiplier=1"]
+    volumes:
+      - private_evidence:/app/private_flood_evidence
+      - private_models:/app/private_flood_models
+  beat:
+    environment:
+      FLOOD_ADAPTIVE_ENABLED: "1"
+  flood-critical:
+    image: ${AQUA_BACKEND_IMAGE:?Set AQUA_BACKEND_IMAGE to the tested backend image}
+    env_file: .env
+    environment:
+      FLOOD_ADAPTIVE_ENABLED: "1"
+    command: ["python", "-m", "celery", "-A", "config", "worker", "-l", "info", "-Q", "flood_critical", "--concurrency=2", "--prefetch-multiplier=1"]
+    volumes:
+      - model:/app/core/flood_camera_monitoring/infra/machine_model
+      - media:/app/media
+      - private_evidence:/app/private_flood_evidence
+      - private_models:/app/private_flood_models
+    restart: unless-stopped
+  flood-training:
+    profiles: ["training"]
+    image: ${AQUA_BACKEND_IMAGE:?Set AQUA_BACKEND_IMAGE to the tested backend image}
+    env_file: .env
+    command: ["python", "-m", "celery", "-A", "config", "worker", "-l", "info", "-Q", "flood_training", "--concurrency=1", "--prefetch-multiplier=1"]
+    volumes:
+      - model:/app/core/flood_camera_monitoring/infra/machine_model
+      - private_evidence:/app/private_flood_evidence
+      - private_models:/app/private_flood_models
+    restart: unless-stopped
+volumes:
+  private_evidence:
+  private_models:

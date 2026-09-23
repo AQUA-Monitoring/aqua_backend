@@ -93,7 +93,7 @@ def sync_images(data: list, token: str) -> tuple[int, int]:
 
         if image is None:
             image = Image(attachment_key=attachment_key, description=description)
-            image.file.save(filename, ContentFile(payload), save=False)
+            image.file = ContentFile(payload, name=filename)
             image.save()
             created += 1
         else:
@@ -134,7 +134,7 @@ def sync_documents(data: list, token: str) -> tuple[int, int]:
                 attachment_key=attachment_key,
                 description=description,
             )
-            document.file.save(filename, ContentFile(payload), save=False)
+            document.file = ContentFile(payload, name=filename)
             document.save()
             created += 1
         else:

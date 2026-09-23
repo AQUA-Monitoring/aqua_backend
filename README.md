@@ -173,6 +173,24 @@ Principais variáveis:
 | `ACCESS_TOKEN` | Token Mercado Pago |
 | `FLOOD_MODEL_DRIVE_ID` | ID do modelo ML no Google Drive |
 | `API_URL` | URL da API para sync remoto |
+| `INTERNAL_METRICS_ENABLED` | Habilita o endpoint privado `/internal/metrics` somente quando vale `1` |
+| `INTERNAL_METRICS_TOKEN` | Bearer token exclusivo exigido pelo endpoint de métricas |
+
+### Métricas privadas para o Aqua Ops
+
+O endpoint `/internal/metrics` permanece desativado quando a flag não está
+configurada. Para permitir que o Prometheus privado do Aqua Ops faça a coleta,
+configure no ambiente do backend:
+
+```dotenv
+INTERNAL_METRICS_ENABLED=1
+INTERNAL_METRICS_TOKEN=<mesmo-conteudo-do-secret-usado-pelo-prometheus>
+```
+
+O valor de `INTERNAL_METRICS_TOKEN` deve ser exatamente o conteúdo do secret
+entregue ao Prometheus. Não reutilize credenciais de usuário, JWT, token do
+callback de CI ou segredo do Django, e não registre o valor real no
+repositório.
 
 ---
 

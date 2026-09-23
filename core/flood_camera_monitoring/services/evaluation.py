@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import os
-import time
 from typing import List, Tuple, Dict, Any
 
 from core.flood_camera_monitoring.infra.opencv_stream import (
@@ -51,21 +51,25 @@ def operational_confidence(summary: Dict[str, Any], state: str) -> float:
 
 
 def capture_frames(stream_url: str, cfg: EvalConfig) -> list[bytes]:
+    """Decode a complete finite source and retain its final frames in order.
+
+    Demo segment URLs identify complete media files. A bounded deque keeps the
+    memory cost independent of the segment duration while preserving the last
+    decodable frames in chronological order.
+    """
     stream = OpenCVVideoStream(stream_url)
-    frames: list[bytes] = []
+    frames: deque[bytes] = deque(maxlen=max(1, int(cfg.sample_frames)))
     try:
         for _ in range(max(0, int(cfg.warmup_drops))):
             _ = stream.grab()
-        attempts = max(1, int(cfg.sample_frames))
-        for i in range(attempts):
+        while True:
             img_bytes = stream.grab()
-            if img_bytes:
-                frames.append(img_bytes)
-            if i < attempts - 1 and cfg.sample_interval_ms > 0:
-                time.sleep(cfg.sample_interval_ms / 1000.0)
+            if img_bytes is None:
+                break
+            frames.append(img_bytes)
     finally:
         stream.close()
-    return frames
+    return list(frames)
 
 
 def aggregate_predictions(

@@ -4,6 +4,7 @@ from django.db.models import Q
 
 import uuid
 
+from django.conf import settings
 from core.common.models import TimestampedModel
 
 
@@ -185,6 +186,95 @@ class GeodataDataset(TimestampedModel):
             models.UniqueConstraint(fields=["city", "kind", "authority"], condition=Q(status="active"), name="uniq_active_geodata_source"),
         ]
         indexes = [models.Index(fields=["city", "kind", "status"])]
+
+
+class ReferenceBaseRelease(TimestampedModel):
+    """Pacote imutavel e auditavel de uma revisao da base de referencia.
+
+    Os registros importados permanecem em linhas particionadas de staging ate
+    uma promocao explicita. Assim, validar ou inspecionar um pacote nunca
+    altera o catalogo publico usado pelas APIs legadas.
+    """
+
+    class Status(models.TextChoices):
+        STAGED = "staged", "Preparado"
+        VALIDATED = "validated", "Validado"
+        PROMOTING = "promoting", "Em promocao"
+        ACTIVE = "active", "Ativo"
+        SUPERSEDED = "superseded", "Substituido"
+        REJECTED = "rejected", "Rejeitado"
+        FAILED = "failed", "Falhou"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    revision = models.CharField(max_length=160, unique=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.STAGED, db_index=True)
+    schema_version = models.PositiveSmallIntegerField(default=1)
+    archive_sha256 = models.CharField(max_length=64, unique=True)
+    manifest = models.JSONField(default=dict)
+    dataset = models.ForeignKey(
+        GeodataDataset,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="reference_base_releases",
+    )
+    validated_at = models.DateTimeField(null=True, blank=True)
+    promoted_at = models.DateTimeField(null=True, blank=True)
+    superseded_at = models.DateTimeField(null=True, blank=True)
+    failure_detail = models.TextField(blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                models.Value(1),
+                condition=Q(status="active"),
+                name="uniq_active_reference_base_release",
+            )
+        ]
+        indexes = [models.Index(fields=["status", "revision"])]
+
+
+class ReferenceBaseReleaseRecord(models.Model):
+    """Uma linha NDJSON de staging, particionada e ordenada."""
+
+    release = models.ForeignKey(
+        ReferenceBaseRelease, on_delete=models.CASCADE, related_name="records"
+    )
+    partition = models.CharField(max_length=64)
+    ordinal = models.PositiveBigIntegerField()
+    record = models.JSONField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["release", "partition", "ordinal"],
+                name="uniq_release_partition_ordinal",
+            )
+        ]
+        indexes = [models.Index(fields=["release", "partition", "ordinal"])]
+
+
+class ReferenceBaseReleaseAudit(TimestampedModel):
+    class Action(models.TextChoices):
+        IMPORT = "import", "Importacao"
+        PROMOTE = "promote", "Promocao"
+        ROLLBACK = "rollback", "Rollback"
+        REJECT = "reject", "Rejeicao"
+        FAIL = "fail", "Falha"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    release = models.ForeignKey(ReferenceBaseRelease, on_delete=models.PROTECT, related_name="audit_entries")
+    action = models.CharField(max_length=16, choices=Action.choices)
+    from_revision = models.CharField(max_length=160, blank=True)
+    to_revision = models.CharField(max_length=160)
+    expected_revision = models.CharField(max_length=160, blank=True)
+    justification = models.TextField()
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
+    succeeded = models.BooleanField(default=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["action", "created_at"])]
 
 
 class Street(TimestampedModel):

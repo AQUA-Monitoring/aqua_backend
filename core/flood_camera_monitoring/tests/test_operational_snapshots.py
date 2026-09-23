@@ -365,6 +365,89 @@ class CameraOperationalSnapshotTests(TestCase):
                     )
                 )
 
+    def test_offline_camera_keeps_stream_state_but_hides_previous_analysis(self):
+        snapshot = self.snapshot()
+        snapshot.stream_status = CameraOperationalSnapshot.StreamStatus.ONLINE
+        snapshot.analysis_status = CameraOperationalSnapshot.AnalysisStatus.AVAILABLE
+        snapshot.classification = (
+            CameraOperationalSnapshot.CameraClassification.FLOOD_INDICATION
+        )
+        snapshot.prob_normal = 5.0
+        snapshot.prob_medium = 5.0
+        snapshot.prob_flooded = 90.0
+        snapshot.confidence = 90.0
+        snapshot.frames = 3
+        snapshot.model_status = CameraOperationalSnapshot.ModelStatus.READY
+        snapshot.model_version = "model-v1"
+        snapshot.analyzed_at = timezone.now()
+        snapshot.save()
+        self.camera.status = Camera.CameraStatus.OFFLINE
+        self.camera.save(update_fields=["status"])
+
+        result = PredictAllCamerasService().run()
+        self.assertEqual(result, [])
+
+        from core.flood_camera_monitoring.services.operational_snapshot import (
+            snapshot_prediction_payload,
+        )
+
+        detail_projection = snapshot_prediction_payload(self.camera, snapshot)
+        self.assertEqual(
+            detail_projection["meta"]["stream_status"],
+            CameraOperationalSnapshot.StreamStatus.ONLINE,
+        )
+        self.assertEqual(
+            detail_projection["status"],
+            CameraOperationalSnapshot.AnalysisStatus.NOT_ANALYZED,
+        )
+        self.assertIsNone(detail_projection["classification"])
+        self.assertTrue(
+            all(
+                value is None
+                for value in detail_projection["probabilities"].values()
+            )
+        )
+
+    def test_inactive_camera_hides_stream_and_previous_analysis(self):
+        snapshot = self.snapshot()
+        snapshot.stream_status = CameraOperationalSnapshot.StreamStatus.ONLINE
+        snapshot.analysis_status = CameraOperationalSnapshot.AnalysisStatus.AVAILABLE
+        snapshot.classification = (
+            CameraOperationalSnapshot.CameraClassification.FLOOD_INDICATION
+        )
+        snapshot.prob_normal = 5.0
+        snapshot.prob_medium = 5.0
+        snapshot.prob_flooded = 90.0
+        snapshot.confidence = 90.0
+        snapshot.frames = 3
+        snapshot.model_status = CameraOperationalSnapshot.ModelStatus.READY
+        snapshot.model_version = "model-v1"
+        snapshot.analyzed_at = timezone.now()
+        snapshot.save()
+        self.camera.status = Camera.CameraStatus.INACTIVE
+        self.camera.save(update_fields=["status"])
+
+        from core.flood_camera_monitoring.services.operational_snapshot import (
+            snapshot_prediction_payload,
+        )
+
+        detail_projection = snapshot_prediction_payload(self.camera, snapshot)
+        self.assertEqual(
+            detail_projection["meta"]["stream_status"],
+            CameraOperationalSnapshot.StreamStatus.UNKNOWN,
+        )
+        self.assertEqual(
+            detail_projection["status"],
+            CameraOperationalSnapshot.AnalysisStatus.NOT_ANALYZED,
+        )
+        self.assertIsNone(detail_projection["classification"])
+        self.assertTrue(
+            all(
+                value is None
+                for value in detail_projection["probabilities"].values()
+            )
+        )
+
     def test_current_threshold_mapping_is_preserved(self):
         classify = AnalyzeAllCamerasService._classification
         self.assertEqual(

@@ -8,4 +8,15 @@ class PostSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Post
-        fields = "__all__"
+        fields = (
+            "id",
+            "title",
+            "subject",
+            "author",
+            "content",
+            "banner_image",
+            "content_image",
+            "reference_title",
+            "reference_url",
+            "created_at",
+        )

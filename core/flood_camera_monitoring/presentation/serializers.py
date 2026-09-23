@@ -9,7 +9,7 @@ from core.flood_camera_monitoring.services.operational_snapshot import (
     snapshot_prediction_payload,
     snapshot_stale_seconds,
 )
-from core.flood_camera_monitoring.infra.models import CameraOperationalSnapshot
+from core.flood_camera_monitoring.infra.models import Camera, CameraOperationalSnapshot
 
 
 def operational_stale_after_seconds() -> int:
@@ -54,6 +54,10 @@ class CameraAddressInputSerializer(RejectUnknownFieldsMixin, serializers.Seriali
     longitude = serializers.FloatField(min_value=-180.0, max_value=180.0)
 
 
+class CameraUpdateAddressInputSerializer(CameraAddressInputSerializer):
+    neighborhood_id = serializers.UUIDField(required=False, allow_null=True)
+
+
 class CameraCreateSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
     description = serializers.CharField(max_length=255, allow_blank=False)
     video_hls = serializers.URLField(max_length=512, allow_blank=False)
@@ -67,6 +71,25 @@ class CameraCreateSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
         if urlsplit(normalized).scheme not in {"http", "https"}:
             raise serializers.ValidationError("Use uma URL HTTP ou HTTPS.")
         return normalized
+
+
+class CameraUpdateSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
+    """Campos mutáveis da câmera, exclusivos da administração."""
+
+    description = serializers.CharField(max_length=255, required=False, allow_blank=False)
+    video_hls = serializers.URLField(max_length=512, required=False, allow_blank=False)
+    video_embed = serializers.URLField(max_length=512, required=False, allow_blank=True, allow_null=True)
+    status = serializers.ChoiceField(choices=Camera.CameraStatus.names, required=False)
+    address = CameraUpdateAddressInputSerializer(required=False)
+
+    def validate_video_hls(self, value: str) -> str:
+        normalized = normalize_hls_url(value)
+        if urlsplit(normalized).scheme not in {"http", "https"}:
+            raise serializers.ValidationError("Use uma URL HTTP ou HTTPS.")
+        return normalized
+
+    def validate_status(self, value: str) -> int:
+        return Camera.CameraStatus[value].value
 
 
 class NearbyCamerasQuerySerializer(serializers.Serializer):
@@ -107,6 +130,22 @@ class DemoStateSerializer(serializers.Serializer):
     """Validate the only mutable field exposed by the demo control API."""
 
     state = serializers.ChoiceField(choices=("auto", "normal", "flooded"))
+
+
+class DemoPredictionQuerySerializer(serializers.Serializer):
+    """Select the exact HLS segment currently rendered by the demo player."""
+
+    sequence = serializers.IntegerField(required=False, min_value=0)
+
+
+class DemoPredictionBatchSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
+    """Validate a temporal comparison anchored to the rendered HLS segment."""
+
+    session_id = serializers.CharField(max_length=128, allow_blank=False)
+    anchor_sequence = serializers.IntegerField(min_value=0)
+    model_version = serializers.CharField(
+        required=False, max_length=128, allow_blank=False
+    )
 
 
 def _date_time(value):
@@ -210,6 +249,7 @@ class CameraReadSerializer(serializers.Serializer):
     latitude = serializers.SerializerMethodField()
     longitude = serializers.SerializerMethodField()
     operational = serializers.SerializerMethodField()
+    monitoring = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
     created_by = serializers.SerializerMethodField()
@@ -260,6 +300,8 @@ class CameraReadSerializer(serializers.Serializer):
         return {"id": str(neighborhood.id), "name": neighborhood.name}
 
     def get_region(self, camera):
+        if camera.region_id:
+            return {"id": str(camera.region_id), "name": camera.region.name}
         neighborhood, _, _ = self._legacy_location(camera)
         region = neighborhood.region if neighborhood else None
         if region is None:
@@ -277,6 +319,15 @@ class CameraReadSerializer(serializers.Serializer):
     @staticmethod
     def get_operational(camera):
         return build_operational_payload(camera)
+
+    @staticmethod
+    def get_monitoring(camera):
+        state = getattr(camera, 'monitoring', None)
+        if state is None:
+            return None
+        return {'level': state.level, 'reason': state.reason,
+            'next_analysis_at': state.next_analysis_at,
+            'strong_streak': state.strong_streak}
 
     @staticmethod
     def get_created_by(camera):
@@ -304,7 +355,7 @@ class CameraReadSerializer(serializers.Serializer):
         field intact for clients that need the full camera inspection route.
         Inactive cameras never receive a playable preview.
         """
-        if camera.status != camera.CameraStatus.ACTIVE:
+        if camera.status == camera.CameraStatus.INACTIVE:
             return None
         return camera.video_hls or None
 

@@ -3,7 +3,7 @@ from django.test import TestCase
 from django.contrib.gis.geos import LineString, MultiLineString, MultiPolygon, Polygon
 from django.utils import timezone
 
-from core.addressing.models import City, GeodataDataset, Neighborhood, Region, Street
+from core.addressing.models import City, GeodataDataset, Neighborhood, ReferenceBaseRelease, Region, Street
 
 from core.flood_point_registering.presentation.serializers.RegisterSerializer import (
     FloodPointRegisterSerializer,
@@ -30,6 +30,10 @@ class FloodPointSpatialFallbackTests(TestCase):
         self.assertIsNone(value["props"]["geometry"])
 
     def test_frontend_payload_persists_and_resolves_spatial_evidence(self):
+        ReferenceBaseRelease.objects.create(
+            revision="territorial-2026-01", status="active", schema_version=1,
+            archive_sha256="c" * 64, manifest={},
+        )
         city_geometry = MultiPolygon(Polygon((
             (-48.90, -26.40), (-48.70, -26.40), (-48.70, -26.20),
             (-48.90, -26.20), (-48.90, -26.40),
@@ -66,12 +70,15 @@ class FloodPointSpatialFallbackTests(TestCase):
             "props": [{"type": "Feature", "geometry": footprint, "properties": {}}],
             "location": {"type": "Point", "coordinates": [-48.80, -26.30]},
             "footprint": footprint,
+            "reference_base_revision": "territorial-2026-01",
         })
         self.assertTrue(serializer.is_valid(), serializer.errors)
         instance = serializer.save()
         self.assertIsNotNone(instance.location)
         self.assertIsNotNone(instance.footprint)
         self.assertEqual(instance.territory_resolution["city_id"], str(city.pk))
+        self.assertEqual(instance.territory_resolution["reference_base_revision"], "territorial-2026-01")
+        self.assertEqual(set(instance.neighborhood_links.values_list("reference_base_revision", flat=True)), {"territorial-2026-01"})
         self.assertIsNotNone(instance.spatial_event_id)
         self.assertEqual(instance.spatial_event.evidence_kind, "LEGACY_UNCLASSIFIED")
         self.assertEqual(instance.spatial_event.current_revision.footprint, instance.footprint)

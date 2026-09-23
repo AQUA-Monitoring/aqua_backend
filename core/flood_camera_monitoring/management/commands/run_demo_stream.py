@@ -12,6 +12,7 @@ from core.flood_camera_monitoring.demo.controller import (
 )
 from core.flood_camera_monitoring.demo.manifest import DemoManifestError, load_scenario
 from core.flood_camera_monitoring.demo.server import DemoServers
+from core.uploader.models import DemoVideoSource
 
 
 class Command(BaseCommand):
@@ -44,10 +45,29 @@ class Command(BaseCommand):
             "DEMO_STREAM_MEDIA_INTERNAL_BASE_URL", "http://demo-stream:8088"
         )
         try:
+            video_resolver = UploadedVideoResolver(options["work_dir"])
+            persisted_sources = {
+                slot.mode: str(slot.video.attachment_key)
+                for slot in DemoVideoSource.objects.select_related("video").filter(
+                    status=DemoVideoSource.Status.READY,
+                    video__isnull=False,
+                )
+            }
+            active_state = (
+                DemoVideoSource.objects.filter(
+                    active=True,
+                    status=DemoVideoSource.Status.READY,
+                    video__isnull=False,
+                )
+                .values_list("mode", flat=True)
+                .first()
+                or "auto"
+            )
             scenario = load_scenario(
                 options["scenario"],
-                video_resolver=UploadedVideoResolver(options["work_dir"]),
+                video_resolver=video_resolver,
                 require_uploader=True,
+                state_video_keys=persisted_sources,
             )
             controller = DemoStreamController(
                 scenario,
@@ -55,8 +75,9 @@ class Command(BaseCommand):
                 public_hls_url=public_url,
                 internal_base_url=internal_url,
                 source_type="uploader",
+                video_resolver=video_resolver,
             )
-            controller.initialize()
+            controller.initialize(initial_state=active_state)
         except (DemoManifestError, DemoStreamError) as exc:
             raise CommandError(str(exc)) from exc
 

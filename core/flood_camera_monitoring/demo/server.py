@@ -121,6 +121,30 @@ def make_control_handler(
             except (json.JSONDecodeError, DemoStreamError, ValueError) as exc:
                 self._send_json({"detail": str(exc)}, status=400)
 
+        def do_PUT(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            prefix = "/sources/"
+            if not path.startswith(prefix):
+                self._send_json({"detail": "Not found"}, status=404)
+                return
+            if not self._require_authorized():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                attachment_key = (
+                    payload.get("attachment_key") if isinstance(payload, dict) else None
+                )
+                if not isinstance(attachment_key, str) or not attachment_key.strip():
+                    raise DemoStreamError("'attachment_key' must be a non-empty string")
+                self._send_json(
+                    controller.prepare_source(
+                        unquote(path.removeprefix(prefix)), attachment_key.strip()
+                    )
+                )
+            except (json.JSONDecodeError, DemoStreamError, ValueError) as exc:
+                self._send_json({"detail": str(exc)}, status=400)
+
     return ControlHandler
 
 

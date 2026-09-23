@@ -23,17 +23,20 @@ from rest_framework.routers import DefaultRouter
 from core.users.presentation.auth_views import (
     AppTokenRefreshView,
     EmailTokenObtainPairView,
+    SyncTokenView,
 )
 from core.uploader.router import router as uploader_router
 from core.sync.export import ExportView
 from config.core_health import health
 from config.media import serve_media
+from core.flood_camera_monitoring.presentation.metrics_views import internal_metrics
 
 router = DefaultRouter()
 
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("health/", health, name="service-health"),
+    path("internal/metrics", internal_metrics, name="internal-metrics"),
     # JWT auth endpoints
     # Single auth token route using email/password
     path(
@@ -42,6 +45,7 @@ urlpatterns = [
     path(
         "api/auth/token/refresh/", AppTokenRefreshView.as_view(), name="token_refresh"
     ),
+    path("api/sync/token/", SyncTokenView.as_view(), name="sync-token"),
     path("api/users/", include("core.users.presentation.urls")),
     path("api/weather/", include("core.weather.presentation.urls")),
     path("api/forecast/", include("core.forecast.presentation.urls")),
@@ -54,6 +58,7 @@ urlpatterns = [
         "api/floods_point/", include("core.flood_point_registering.presentation.urls")
     ),
     path("api/blog/", include("core.blog.presentation.urls")),
+    path("api/", include("core.notifications.urls")),
     path("api/export/", ExportView.as_view(), name="export-data"),
     path("media/<path:path>", serve_media, name="media-file"),
 ]

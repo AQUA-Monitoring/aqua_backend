@@ -27,6 +27,29 @@ class TokenRefreshTests(TestCase):
         self.assertEqual(refreshed.status_code, 200)
         self.assertIn("access", refreshed.data)
 
+    def test_sync_token_requires_active_superuser(self):
+        self.user.is_superuser = True
+        self.user.save(update_fields=["is_superuser"])
+
+        response = self.client.post(
+            "/api/sync/token/",
+            {"email": self.user.email, "password": "secret-test"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertIn("access", response.data)
+        self.assertEqual(response.data["token_type"], "Bearer")
+
+    def test_sync_token_rejects_non_superuser(self):
+        response = self.client.post(
+            "/api/sync/token/",
+            {"email": self.user.email, "password": "secret-test"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401, response.data)
+
     def test_refresh_for_removed_user_is_unauthorized(self):
         obtained = self.client.post(
             "/api/auth/token/",
@@ -46,3 +69,13 @@ class TokenRefreshTests(TestCase):
             "/api/auth/token/refresh/", {"refresh": "invalid"}, format="json"
         )
         self.assertEqual(response.status_code, 401)
+
+    def test_me_exposes_superuser_flag(self):
+        self.user.is_superuser = True
+        self.user.save(update_fields=["is_superuser"])
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get("/api/users/me/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.data["is_superuser"], True)

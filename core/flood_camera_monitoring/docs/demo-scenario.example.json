@@ -3,6 +3,12 @@
   "segment_seconds": 2,
   "phases": [
     {
+      "name": "automático",
+      "video_attachment_key": "00000000-0000-0000-0000-000000000000",
+      "label": null,
+      "duration_seconds": 30
+    },
+    {
       "name": "trânsito normal",
       "video_attachment_key": "11111111-1111-1111-1111-111111111111",
       "label": "normal",

@@ -8,7 +8,7 @@ from django.db import IntegrityError
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from core.addressing.models import AddressReference, City, GeodataDataset, Neighborhood, Street, StreetNeighborhood
+from core.addressing.models import AddressReference, City, GeodataDataset, Neighborhood, Region, Street, StreetNeighborhood
 
 
 class GeodataApiTests(TestCase):
@@ -21,6 +21,84 @@ class GeodataApiTests(TestCase):
     def test_public_streets_and_protected_address_references(self):
         self.assertEqual(self.client.get("/api/addressing/streets/").status_code, 200)
         self.assertIn(self.client.get("/api/addressing/address-references/").status_code, (401, 403))
+
+    def test_catalog_exposes_neighborhoods_without_inventing_regions(self):
+        Neighborhood.objects.create(
+            name="Costa e Silva",
+            normalized_name="costa e silva",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+
+        response = self.client.get(
+            "/api/addressing/regions-neighborhoods/", {"city_id": self.city.id}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["total_regions"], 0)
+        self.assertEqual(response.data["total_neighborhoods"], 1)
+        self.assertEqual(response.data["neighborhoods"][0]["name"], "Costa e Silva")
+        self.assertIsNone(response.data["neighborhoods"][0]["region"])
+
+    def test_catalog_keeps_region_and_flat_neighborhood_contracts_consistent(self):
+        region = Region.objects.create(
+            name="Centro-Norte",
+            normalized_name="centro-norte",
+            city=self.city.name,
+            city_ref=self.city,
+        )
+        neighborhood = Neighborhood.objects.create(
+            name="América",
+            normalized_name="america",
+            city=self.city.name,
+            city_ref=self.city,
+            region=region,
+        )
+
+        response = self.client.get("/api/addressing/regions-neighborhoods/")
+
+        self.assertEqual(response.data["total_neighborhoods"], 1)
+        self.assertEqual(response.data["neighborhoods"][0]["id"], str(neighborhood.id))
+        self.assertEqual(
+            response.data["regions"][0]["neighborhoods"][0]["id"],
+            str(neighborhood.id),
+        )
+
+    def test_catalog_does_not_expose_inactive_region_as_canonical(self):
+        region = Region.objects.create(
+            name="Região desativada",
+            normalized_name="regiao desativada",
+            city=self.city.name,
+            city_ref=self.city,
+            is_active=False,
+        )
+        Neighborhood.objects.create(
+            name="Bairro pendente",
+            normalized_name="bairro pendente",
+            city=self.city.name,
+            city_ref=self.city,
+            region=region,
+        )
+
+        response = self.client.get(
+            "/api/addressing/regions-neighborhoods/", {"city_id": self.city.id}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["total_regions"], 0)
+        self.assertIsNone(response.data["neighborhoods"][0]["region"])
+
+    def test_v2_streets_expose_reference_provenance_contract(self):
+        response = self.client.get("/api/addressing/v2/streets/")
+        self.assertEqual(response.status_code, 200)
+        item = response.data["results"][0]
+        self.assertEqual(item["classification"], "reference")
+        self.assertEqual(item["precision"], "exact")
+        self.assertIsNone(item["distance_m"])
+        self.assertEqual(item["source"]["authority"], "Prefeitura")
+        self.assertEqual(item["source"]["edition"], "1")
+        self.assertEqual(item["source"]["license"]["name"], "Licença oficial")
+        self.assertEqual(item["provenance"], item["source"])
 
     def test_autocomplete_requires_authentication_and_scopes_streets(self):
         unauthenticated = self.client.get(

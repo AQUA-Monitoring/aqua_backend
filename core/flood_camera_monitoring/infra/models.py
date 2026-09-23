@@ -1,5 +1,9 @@
+from django.core.exceptions import ValidationError
 from django.db import models
 import uuid
+
+from .monitoring_models import (CameraMonitoringState, CameraAnalysisRun, CameraEvidence,
+    CameraReview, MonitoringAudit, FloodModelVersion, ModelShadowResult)
 
 from core.common.models import TimestampedModel
 
@@ -166,3 +170,150 @@ class FloodDetectionRecord(models.Model):
             models.Index(fields=["created_at"]),
             models.Index(fields=["confidence"]),
         ]
+
+
+class OperationalAlert(TimestampedModel):
+    """Indício operacional privado até que um administrador o confirme."""
+
+    class Status(models.TextChoices):
+        OPEN_INDICATION = "OPEN_INDICATION", "OPEN_INDICATION"
+        CONFIRMED = "CONFIRMED", "CONFIRMED"
+        DISMISSED = "DISMISSED", "DISMISSED"
+        RESOLVED = "RESOLVED", "RESOLVED"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    camera = models.ForeignKey(
+        Camera, on_delete=models.PROTECT, related_name="operational_alerts"
+    )
+    region = models.ForeignKey(
+        "addressing.Region",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="camera_operational_alerts",
+    )
+    initial_detection = models.ForeignKey(
+        FloodDetectionRecord,
+        on_delete=models.PROTECT,
+        related_name="alerts_started",
+    )
+    latest_detection = models.ForeignKey(
+        FloodDetectionRecord,
+        on_delete=models.PROTECT,
+        related_name="alerts_latest",
+    )
+    status = models.CharField(
+        max_length=24,
+        choices=Status.choices,
+        default=Status.OPEN_INDICATION,
+        db_index=True,
+    )
+    evidence = models.JSONField(default=dict)
+    first_detected_at = models.DateTimeField()
+    last_detected_at = models.DateTimeField()
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    dismissed_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    confirmed_by = models.ForeignKey(
+        "users.User",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="confirmed_camera_alerts",
+    )
+
+    class Meta:
+        ordering = ["-last_detected_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["camera"],
+                condition=models.Q(
+                    status__in=["OPEN_INDICATION", "CONFIRMED"]
+                ),
+                name="uniq_active_operational_alert_per_camera",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["status", "last_detected_at"],
+                name="flood_camer_status_975f5c_idx",
+            ),
+            models.Index(
+                fields=["region", "status"], name="flood_camer_region_9e7a91_idx"
+            ),
+        ]
+
+
+class OperationalAlertTransition(models.Model):
+    class Origin(models.TextChoices):
+        CAMERA_ANALYSIS = "CAMERA_ANALYSIS", "CAMERA_ANALYSIS"
+        ADMIN = "ADMIN", "ADMIN"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    alert = models.ForeignKey(
+        OperationalAlert, on_delete=models.CASCADE, related_name="transitions"
+    )
+    from_status = models.CharField(
+        max_length=24, choices=OperationalAlert.Status.choices, null=True, blank=True
+    )
+    to_status = models.CharField(max_length=24, choices=OperationalAlert.Status.choices)
+    actor = models.ForeignKey(
+        "users.User",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="camera_alert_transitions",
+    )
+    origin = models.CharField(max_length=24, choices=Origin.choices)
+    reason = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(
+                fields=["alert", "created_at"],
+                name="flood_camer_alert_i_b57fc9_idx",
+            )
+        ]
+
+
+class AlertPublication(models.Model):
+    """Cópia pública imutável criada após confirmação humana."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    alert = models.OneToOneField(
+        OperationalAlert, on_delete=models.PROTECT, related_name="publication"
+    )
+    title = models.CharField(max_length=180)
+    message = models.TextField()
+    region = models.ForeignKey(
+        "addressing.Region",
+        on_delete=models.PROTECT,
+        related_name="camera_alert_publications",
+    )
+    camera = models.ForeignKey(
+        Camera, on_delete=models.PROTECT, related_name="alert_publications"
+    )
+    confirmed_by = models.ForeignKey(
+        "users.User", on_delete=models.PROTECT, related_name="alert_publications"
+    )
+    detected_at = models.DateTimeField()
+    confirmed_at = models.DateTimeField()
+    classification = models.CharField(max_length=32)
+    confidence = models.FloatField()
+    probabilities = models.JSONField(default=dict)
+    model_version = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def save(self, *args, **kwargs):
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValidationError("Alert publications are immutable")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Alert publications are immutable")

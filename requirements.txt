@@ -61,6 +61,7 @@ shapely==2.1.1
 
 # 🌐 HTTP & Networking
 requests[socks]==2.32.5
+pywebpush==2.3.0
 urllib3==2.5.0
 certifi==2025.8.3
 charset-normalizer==3.4.3

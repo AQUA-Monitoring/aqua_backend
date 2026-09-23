@@ -7,6 +7,10 @@ from core.flood_camera_monitoring.presentation.demo_control_views import (
     DemoStatusView,
 )
 from core.flood_camera_monitoring.presentation.camera_views import CameraMetadataViewSet
+from core.flood_camera_monitoring.presentation.demo_source_views import (
+    DemoSourcesView,
+    DemoSourceUploadView,
+)
 
 
 urlpatterns = [
@@ -22,7 +26,7 @@ urlpatterns = [
     ),
     path(
         "cameras/<uuid:pk>/",
-        CameraMetadataViewSet.as_view({"get": "retrieve"}),
+        CameraMetadataViewSet.as_view({"get": "retrieve", "put": "update", "patch": "partial_update"}),
         name="cameras-detail",
     ),
     path(
@@ -32,4 +36,10 @@ urlpatterns = [
     ),
     path("demo", DemoStatusView.as_view(), name="demo-status"),
     path("demo/state", DemoStateView.as_view(), name="demo-state"),
+    path("demo/sources", DemoSourcesView.as_view(), name="demo-sources"),
+    path(
+        "demo/sources/<str:mode>",
+        DemoSourceUploadView.as_view(),
+        name="demo-source-upload",
+    ),
 ]

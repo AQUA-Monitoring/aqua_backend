@@ -22,6 +22,7 @@ class UploadSerializerTests(TestCase):
             name="Administrador",
             email="admin-upload@example.com",
             type=User.UserType.ADMIN,
+            is_superuser=True,
         )
         self.client.force_authenticate(user=self.admin)
 

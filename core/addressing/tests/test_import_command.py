@@ -10,8 +10,9 @@ from django.utils import timezone
 
 from django.contrib.gis.geos import MultiPolygon, Polygon
 
-from core.addressing.models import AddressReference, City, GeodataDataset, Neighborhood, RoadAxisSegment, Street, StreetNeighborhood
+from core.addressing.models import AddressReference, City, GeodataDataset, Neighborhood, Region, RoadAxisSegment, Street, StreetNeighborhood
 from core.addressing.management.commands.import_addressing_dataset import canonical_name, chunked, geos_geometry, iter_source_features, source_street_name
+from core.flood_camera_monitoring.infra.models import Camera
 
 
 class AddressingImportCommandTests(TestCase):
@@ -36,6 +37,20 @@ class AddressingImportCommandTests(TestCase):
     def test_canonical_name_preserves_words_and_accents(self):
         self.assertEqual(canonical_name("RUA GETÚLIO VARGAS"), "Rua Getúlio Vargas")
 
+    def test_neighborhood_import_canonicalizes_display_and_search_names(self):
+        self.payload["features"][0]["properties"]["bairro"] = "COSTA E SILVA"
+
+        with TemporaryDirectory() as directory:
+            call_command(
+                "import_addressing_dataset",
+                str(self._file(directory)),
+                **self._options(),
+            )
+
+        neighborhood = Neighborhood.objects.get()
+        self.assertEqual(neighborhood.name, "Costa e Silva")
+        self.assertEqual(neighborhood.normalized_name, "costa e silva")
+
     def test_street_code_groups_logical_street_and_keeps_segments(self):
         payload = {"type": "FeatureCollection", "features": [
             {"type": "Feature", "properties": {"id": "seg-1", "codlogra": "42", "name": "Rua Getulio"}, "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 0]]}},
@@ -57,6 +72,58 @@ class AddressingImportCommandTests(TestCase):
             call_command("import_addressing_dataset", str(path), **self._options())
         self.assertEqual(GeodataDataset.objects.count(), 1)
         self.assertEqual(Neighborhood.objects.count(), 1)
+
+    def test_simgeo_region_import_links_neighborhood_and_reprocesses_camera(self):
+        city = City.objects.get(name="Joinville")
+        city.geometry = MultiPolygon(
+            Polygon(((-1, -1), (2, -1), (2, 2), (-1, 2), (-1, -1))),
+            srid=4326,
+        )
+        city.save(update_fields=["geometry"])
+        neighborhood = Neighborhood.objects.create(
+            name="Centro",
+            city=city.name,
+            city_ref=city,
+            geometry=MultiPolygon(
+                Polygon(((0, 0), (1, 0), (1, 1), (0, 1), (0, 0))),
+                srid=4326,
+            ),
+        )
+        camera = Camera.objects.create(
+            description="Avenida JK - Centro",
+            city=city,
+            neighborhood=neighborhood,
+            latitude=0.5,
+            longitude=0.5,
+        )
+        payload = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"objectid": 25, "sb": "CENTRO-NORTE"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[-1, -1], [2, -1], [2, 2], [-1, 2], [-1, -1]]],
+                },
+            }],
+        }
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "regioes.geojson"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            call_command(
+                "import_joinville_simgeo_regions",
+                geojson_path=str(path),
+                source_version="test-1",
+            )
+
+        region = Region.objects.get()
+        neighborhood.refresh_from_db()
+        camera.refresh_from_db()
+        self.assertEqual(region.name, "CENTRO-NORTE")
+        self.assertEqual(region.official_code, "25")
+        self.assertEqual(neighborhood.region, region)
+        self.assertEqual(camera.region, region)
+        self.assertEqual(camera.territory_resolution["region_id"], str(region.id))
 
     def test_canonical_city_code_and_crs_aliases(self):
         with TemporaryDirectory() as directory:

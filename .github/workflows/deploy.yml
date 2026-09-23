@@ -1,12 +1,22 @@
 name: 'deploy'
 
 on:
-  push:
-    branches:
-      - main
+  # Legacy Dokku deployment kept only for an explicitly approved manual
+  # recovery. Docker Compose and Server Ops are the canonical release path.
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type LEGACY_DOKKU_RECOVERY to use the retired recovery path
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
+    if: ${{ inputs.confirmation == 'LEGACY_DOKKU_RECOVERY' }}
+    environment: legacy-dokku-recovery
     runs-on: ubuntu-24.04
     steps:
       - name: Cloning repo

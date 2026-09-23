@@ -14,6 +14,7 @@ from rest_framework.response import Response
 
 from core.flood_camera_monitoring.presentation.serializers import (
     CameraCreateSerializer,
+    CameraUpdateSerializer,
     CameraListSerializer,
     CameraReadSerializer,
     NearbyCamerasQuerySerializer,
@@ -31,6 +32,7 @@ from core.addressing.models import (
     City,
     GeodataDataset,
     Neighborhood,
+    Region,
     Street,
 )
 from core.addressing.geojson import point_inside_geometry
@@ -39,7 +41,12 @@ from core.flood_camera_monitoring.services.nearby import (
     find_nearby_cameras,
 )
 from core.flood_camera_monitoring.services.territorial_context import apply_camera_territorial_context
-from core.addressing.services import TerritoryResolutionError
+from core.flood_camera_monitoring.services.operational_alerts import (
+    canonical_region_for_camera,
+    canonical_region_for_neighborhood,
+    sync_active_alert_regions_for_camera,
+)
+from core.addressing.services import TerritoryResolutionError, TerritoryResolver
 from core.flood_camera_monitoring.infra.models import (
     Camera,
     CameraOperationalSnapshot,
@@ -48,6 +55,23 @@ from core.users.permissions import IsAppAdmin
 import uuid
 from config.pagination import DefaultPageNumberPagination
 from core.common.mixins import SafeOrderingMixin
+from core.common.cache import cache_delete
+
+
+PREDICT_ALL_CACHE_KEY = "flood:predict_all"
+CAMERA_ACTIVATION_REGION_ERROR = (
+    "A câmera precisa estar vinculada a uma região ativa da Base "
+    "georreferenciada oficial antes da ativação."
+)
+
+
+def _invalidate_predict_all_cache() -> None:
+    """Best-effort invalidation after a camera leaves the analysis set."""
+    try:
+        cache_delete(PREDICT_ALL_CACHE_KEY)
+    except Exception:
+        # Cache availability must not make an administrative update fail.
+        pass
 
 
 def _camera_metadata_queryset():
@@ -59,6 +83,7 @@ def _camera_metadata_queryset():
         "neighborhood",
         "neighborhood__region",
         "operational_snapshot",
+        "monitoring",
         "created_by",
         "city",
         "region",
@@ -117,7 +142,7 @@ def _snapshot_prediction_response(request, view):
 
 
 def _with_operational_priority(queryset, stale_before):
-    valid_prediction = Q(
+    valid_prediction = Q(status=Camera.CameraStatus.ACTIVE) & Q(
         operational_snapshot__analysis_status=(
             CameraOperationalSnapshot.AnalysisStatus.AVAILABLE
         ),
@@ -140,7 +165,7 @@ def _with_operational_priority(queryset, stale_before):
         operational_snapshot__confidence__lte=100.0,
         operational_snapshot__model_version__isnull=False,
     ) & ~Q(operational_snapshot__model_version="")
-    failure_or_stale = (
+    failure_or_stale = Q(status=Camera.CameraStatus.ACTIVE) & (
         Q(
             operational_snapshot__analysis_status__in=[
                 CameraOperationalSnapshot.AnalysisStatus.STALE,
@@ -221,7 +246,7 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
     default_ordering = ["_operational_priority", "description"]
 
     def get_permissions(self):
-        if self.action == "create":
+        if self.action in {"create", "update", "partial_update"}:
             return [permissions.IsAuthenticated(), IsAppAdmin()]
         return [permissions.AllowAny()]
 
@@ -311,21 +336,39 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
                 )
             if analysis_status == CameraOperationalSnapshot.AnalysisStatus.STALE:
                 queryset = queryset.filter(
-                    Q(operational_snapshot__analysis_status=analysis_status)
-                    | Q(
-                        operational_snapshot__analysis_status=(
-                            CameraOperationalSnapshot.AnalysisStatus.AVAILABLE
-                        ),
-                        operational_snapshot__analyzed_at__lte=stale_before,
+                    Q(status=Camera.CameraStatus.ACTIVE)
+                    & (
+                        Q(operational_snapshot__analysis_status=analysis_status)
+                        | Q(
+                            operational_snapshot__analysis_status=(
+                                CameraOperationalSnapshot.AnalysisStatus.AVAILABLE
+                            ),
+                            operational_snapshot__analyzed_at__lte=stale_before,
+                        )
                     )
                 )
             elif analysis_status == CameraOperationalSnapshot.AnalysisStatus.AVAILABLE:
                 queryset = queryset.filter(
+                    status=Camera.CameraStatus.ACTIVE,
                     operational_snapshot__analysis_status=analysis_status,
                     operational_snapshot__analyzed_at__gt=stale_before,
                 )
+            elif analysis_status == CameraOperationalSnapshot.AnalysisStatus.NOT_ANALYZED:
+                queryset = queryset.filter(
+                    Q(
+                        status__in=[
+                            Camera.CameraStatus.OFFLINE,
+                            Camera.CameraStatus.INACTIVE,
+                        ]
+                    )
+                    | Q(
+                        status=Camera.CameraStatus.ACTIVE,
+                        operational_snapshot__analysis_status=analysis_status,
+                    )
+                )
             else:
                 queryset = queryset.filter(
+                    status=Camera.CameraStatus.ACTIVE,
                     operational_snapshot__analysis_status=analysis_status
                 )
 
@@ -342,6 +385,7 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             queryset = queryset.filter(
+                status=Camera.CameraStatus.ACTIVE,
                 operational_snapshot__analysis_status=(
                     CameraOperationalSnapshot.AnalysisStatus.AVAILABLE
                 ),
@@ -399,6 +443,212 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
             ).data
         )
 
+    def update(self, request, pk=None):
+        return self._update(request, pk)
+
+    def partial_update(self, request, pk=None):
+        return self._update(request, pk)
+
+    def _update(self, request, pk):
+        try:
+            camera_id = UUID(str(pk))
+        except (ValueError, TypeError, AttributeError):
+            camera_id = None
+        camera = _camera_metadata_queryset().filter(pk=camera_id).first()
+        if camera is None:
+            return Response({"detail": "Câmera não encontrada."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = CameraUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if not data:
+            return Response({"detail": "Informe ao menos um campo para atualizar."}, status=status.HTTP_400_BAD_REQUEST)
+
+        previous_status = camera.status
+        previous_region = canonical_region_for_camera(camera)
+        target_status = data.get("status", previous_status)
+        target_region = previous_region
+        address_city = None
+        address_neighborhood = None
+
+        address_data = data.get("address")
+        if address_data is not None:
+            required = {"city_id", "street", "latitude", "longitude"}
+            missing = sorted(required - set(address_data))
+            if missing:
+                return Response(
+                    {
+                        "address": {
+                            name: ["Campo obrigatório para alterar o endereço."]
+                            for name in missing
+                        }
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            address_city = City.objects.filter(pk=address_data["city_id"]).first()
+            if address_city is None:
+                return Response(
+                    {"address": {"city_id": ["Cidade não encontrada."]}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            submitted_neighborhood_id = address_data.get("neighborhood_id")
+            submitted_neighborhood = None
+            if submitted_neighborhood_id:
+                submitted_neighborhood = (
+                    Neighborhood.objects.select_related("region", "city_ref")
+                    .filter(pk=submitted_neighborhood_id, is_active=True)
+                    .first()
+                )
+            if submitted_neighborhood_id and (
+                submitted_neighborhood is None
+                or (
+                    submitted_neighborhood.city_ref_id
+                    and submitted_neighborhood.city_ref_id != address_city.id
+                )
+            ):
+                return Response(
+                    {
+                        "address": {
+                            "neighborhood_id": [
+                                "Bairro não encontrado ou incompatível com a cidade."
+                            ]
+                        }
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            official_regions_available = Region.objects.filter(
+                city_ref=address_city, is_active=True, geometry__isnull=False
+            ).exists()
+            if official_regions_available:
+                try:
+                    resolution = TerritoryResolver().resolve_point(
+                        Point(
+                            address_data["longitude"],
+                            address_data["latitude"],
+                            srid=4326,
+                        )
+                    )
+                except TerritoryResolutionError as exc:
+                    return Response(
+                        {"address": {"coordinates": [str(exc)]}},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if resolution.city.id != address_city.id:
+                    return Response(
+                        {"address": {"city_id": ["A coordenada não pertence à cidade informada."]}},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if (
+                    submitted_neighborhood
+                    and resolution.neighborhood
+                    and submitted_neighborhood.id != resolution.neighborhood.id
+                ):
+                    return Response(
+                        {"address": {"neighborhood_id": [
+                            "O bairro informado não corresponde à coordenada na Base georreferenciada oficial."
+                        ]}},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                address_neighborhood = resolution.neighborhood
+                target_region = resolution.region
+            else:
+                address_neighborhood = submitted_neighborhood
+                target_region = canonical_region_for_neighborhood(
+                    address_neighborhood, address_city
+                )
+
+        becoming_operational = (
+            previous_status == Camera.CameraStatus.INACTIVE
+            and target_status != Camera.CameraStatus.INACTIVE
+        )
+        degrading_operational_territory = (
+            previous_status != Camera.CameraStatus.INACTIVE
+            and target_status != Camera.CameraStatus.INACTIVE
+            and previous_region is not None
+            and target_region is None
+        )
+        if becoming_operational and target_region is None:
+            return Response(
+                {"status": [CAMERA_ACTIVATION_REGION_ERROR]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if degrading_operational_territory:
+            return Response(
+                {
+                    "address": {
+                        "coordinates": [
+                            "Uma câmera operacional vinculada à Base georreferenciada "
+                            "oficial não pode ser movida para um ponto sem região oficial ativa."
+                        ]
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            if "video_hls" in data:
+                existing_streams = Camera.objects.select_for_update().exclude(pk=camera.pk).exclude(video_hls__isnull=True).exclude(video_hls="")
+                if any(normalize_hls_url(url) == data["video_hls"] for url in existing_streams.values_list("video_hls", flat=True)):
+                    return Response({"video_hls": ["Stream HLS já cadastrado."]}, status=status.HTTP_409_CONFLICT)
+                camera.video_hls = data["video_hls"]
+            for field in ("description", "video_embed", "status"):
+                if field in data:
+                    setattr(camera, field, data[field])
+
+            if address_data is not None:
+                city = address_city
+                neighborhood = address_neighborhood
+                latitude, longitude = address_data["latitude"], address_data["longitude"]
+                if latitude == 0 and longitude == 0:
+                    return Response({"address": {"coordinates": ["[0,0] não representa uma localização operacional resolvida."]}}, status=status.HTTP_400_BAD_REQUEST)
+                if camera.address is None:
+                    return Response({"address": ["A câmera não possui endereço para atualizar."]}, status=status.HTTP_400_BAD_REQUEST)
+                address = camera.address
+                address.street = address_data["street"].strip()
+                address.number = address_data.get("number", "").strip()
+                address.state = address_data.get("state", "").strip()
+                address.country = address_data.get("country", "Brazil").strip()
+                address.zipcode = address_data.get("zipcode", "").strip()
+                address.city, address.city_ref, address.neighborhood = city.name, city, neighborhood
+                address.latitude, address.longitude = latitude, longitude
+                address.street_ref = address.address_reference = address.dataset = None
+                address.source_record_id = ""
+                address.save()
+                camera.neighborhood, camera.latitude, camera.longitude = neighborhood, latitude, longitude
+                try:
+                    apply_camera_territorial_context(camera, latitude=latitude, longitude=longitude)
+                except TerritoryResolutionError:
+                    camera.street = camera.road_segment = camera.address_reference = None
+                    camera.territory_resolution = {"method": "LEGACY_ADDRESS", "resolved": False}
+                camera.city = city
+                camera.region = target_region
+                camera.neighborhood = neighborhood
+
+            camera.save()
+            sync_active_alert_regions_for_camera(camera)
+            if camera.status != Camera.CameraStatus.ACTIVE:
+                snapshot, _ = CameraOperationalSnapshot.objects.get_or_create(camera=camera)
+                snapshot.analysis_status = snapshot.AnalysisStatus.NOT_ANALYZED
+                snapshot.classification = None
+                snapshot.prob_normal = snapshot.prob_medium = snapshot.prob_flooded = None
+                snapshot.confidence = snapshot.frames = None
+                snapshot.analysis_started_at = snapshot.analyzed_at = None
+                snapshot.model_status = snapshot.ModelStatus.UNKNOWN
+                snapshot.model_version = snapshot.error_code = None
+                if camera.status == Camera.CameraStatus.INACTIVE:
+                    snapshot.stream_status = snapshot.StreamStatus.UNKNOWN
+                    snapshot.stream_checked_at = None
+                snapshot.save()
+
+            if (
+                previous_status == Camera.CameraStatus.ACTIVE
+                and camera.status == Camera.CameraStatus.OFFLINE
+            ):
+                transaction.on_commit(_invalidate_predict_all_cache)
+
+        camera = _camera_metadata_queryset().get(pk=camera.pk)
+        return Response(CameraReadSerializer(camera, context={"include_created_by": True, "include_inactive_sources": True}).data)
+
     def nearby(self, request, pk=None):
         query = NearbyCamerasQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
@@ -454,7 +704,7 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
                 {"address": {"city_id": ["Cidade não encontrada."]}},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        neighborhood = Neighborhood.objects.select_related("city_ref").filter(
+        neighborhood = Neighborhood.objects.select_related("city_ref", "region").filter(
             pk=address_data["neighborhood_id"]
         ).first()
         if neighborhood is None:
@@ -479,7 +729,6 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
         selected_street = None
         address_reference = None
         street_id = address_data.get("street_id")
@@ -768,14 +1017,17 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
                 # A validação legada de cidade/bairro permanece válida mesmo
                 # quando a nova base territorial ainda não foi carregada.
                 camera.city = city
-                camera.region = neighborhood.region
                 camera.street = selected_street
                 camera.address_reference = address_reference
                 camera.territory_resolution = {"method": "LEGACY_ADDRESS", "resolved": False}
+                camera.city = city
+                camera.region = canonical_region_for_neighborhood(neighborhood, city)
+                camera.neighborhood = neighborhood
             camera.save(update_fields=[
                 "city", "region", "neighborhood", "street", "road_segment",
                 "address_reference", "territory_resolution", "updated_at",
             ])
+            sync_active_alert_regions_for_camera(camera)
             CameraOperationalSnapshot.objects.create(camera=camera)
 
         camera = _camera_metadata_queryset().get(pk=camera.pk)

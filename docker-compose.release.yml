@@ -1,0 +1,16 @@
+services:
+  web:
+    image: ${AQUA_BACKEND_IMAGE:?AQUA_BACKEND_IMAGE must contain an immutable digest}
+    build: !reset null
+
+  worker:
+    image: ${AQUA_BACKEND_IMAGE:?AQUA_BACKEND_IMAGE must contain an immutable digest}
+    build: !reset null
+
+  beat:
+    image: ${AQUA_BACKEND_IMAGE:?AQUA_BACKEND_IMAGE must contain an immutable digest}
+    build: !reset null
+
+  demo-stream:
+    image: ${AQUA_DEMO_IMAGE:?AQUA_DEMO_IMAGE must contain an immutable digest}
+    build: !reset null

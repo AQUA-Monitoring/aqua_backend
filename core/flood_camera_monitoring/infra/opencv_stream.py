@@ -37,7 +37,10 @@ class OpenCVVideoStream(VideoStream):
             # Open first available file lazily on first grab
             self._cap = None
         else:
-            self._cap = cv2.VideoCapture(url, self.backend)
+            self._cap = cv2.VideoCapture(url, self.backend, [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000,
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000,
+            ])
             # Best-effort low latency settings
             try:
                 self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)

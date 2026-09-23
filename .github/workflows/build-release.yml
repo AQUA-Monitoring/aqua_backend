@@ -1,0 +1,244 @@
+name: Build immutable Aqua backend release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Immutable commit SHA registered by Server Ops
+        required: true
+        type: string
+      build_id:
+        description: Server Ops build UUID that will receive the CI result
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: aqua-backend-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout requested release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 1
+
+      - name: Resolve immutable SHA
+        id: release
+        env:
+          REQUESTED_SHA: ${{ inputs.release_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          requested_sha=${REQUESTED_SHA,,}
+          [[ "$requested_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]
+          sha=$(git rev-parse HEAD)
+          test "$sha" = "$requested_sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Server Ops callback configuration
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          CALLBACK_BASE_URL: ${{ vars.SERVER_OPS_CALLBACK_URL }}
+          CALLBACK_TOKEN: ${{ secrets.SERVER_OPS_CI_CALLBACK_TOKEN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.SERVER_OPS_CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.SERVER_OPS_CF_ACCESS_CLIENT_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+          test -n "$CALLBACK_BASE_URL"
+          test -n "$CALLBACK_TOKEN"
+          test -n "$CF_ACCESS_CLIENT_ID"
+          test -n "$CF_ACCESS_CLIENT_SECRET"
+
+      - name: Configure Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build isolated backend test image
+        env:
+          TEST_IMAGE: aqua-backend-ci:${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --target full -f Dockerfile.slim -t "$TEST_IMAGE" .
+
+      - name: Run backend test suite
+        env:
+          TEST_IMAGE: aqua-backend-ci:${{ github.run_id }}-${{ github.run_attempt }}
+          CI_NETWORK: aqua-backend-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          DB_CONTAINER: aqua-backend-ci-db-${{ github.run_id }}-${{ github.run_attempt }}
+          REDIS_CONTAINER: aqua-backend-ci-redis-${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            docker rm -f "$DB_CONTAINER" "$REDIS_CONTAINER" >/dev/null 2>&1 || true
+            docker network rm "$CI_NETWORK" >/dev/null 2>&1 || true
+            docker image rm "$TEST_IMAGE" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker network create "$CI_NETWORK" >/dev/null
+          docker run --detach --name "$DB_CONTAINER" --network "$CI_NETWORK" \
+            -e POSTGRES_DB=aqua_ci \
+            -e POSTGRES_USER=aqua_ci \
+            -e POSTGRES_PASSWORD=aqua_ci \
+            postgis/postgis:16-3.5-alpine >/dev/null
+          docker run --detach --name "$REDIS_CONTAINER" --network "$CI_NETWORK" \
+            redis:7-alpine >/dev/null
+
+          for attempt in {1..30}; do
+            if docker exec "$DB_CONTAINER" pg_isready -U aqua_ci -d aqua_ci >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$attempt" == "30" ]]; then
+              echo "PostgreSQL did not become ready for the test suite" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+          for attempt in {1..30}; do
+            if docker exec "$REDIS_CONTAINER" redis-cli ping >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$attempt" == "30" ]]; then
+              echo "Redis did not become ready for the test suite" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker run --rm --network "$CI_NETWORK" \
+            -e DJANGO_SECRET_KEY=aqua-ci-ephemeral-key \
+            -e DEBUG=0 \
+            -e POSTGRES_DB=aqua_ci \
+            -e POSTGRES_USER=aqua_ci \
+            -e POSTGRES_PASSWORD=aqua_ci \
+            -e POSTGRES_HOST="$DB_CONTAINER" \
+            -e POSTGRES_PORT=5432 \
+            -e CELERY_BROKER_URL="redis://$REDIS_CONTAINER:6379/0" \
+            -e CELERY_RESULT_BACKEND="redis://$REDIS_CONTAINER:6379/1" \
+            -e REDIS_CACHE_URL="redis://$REDIS_CONTAINER:6379/2" \
+            -e INTERNAL_METRICS_ENABLED=0 \
+            "$TEST_IMAGE" python manage.py test
+
+      - name: Authenticate private registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build backend image
+        env:
+          REGISTRY: ghcr.io/aqua-monitoring
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          docker buildx build --pull --target full -f Dockerfile.slim \
+            --tag "$REGISTRY/aqua-backend:$SHA" \
+            --cache-from type=gha,scope=aqua-backend \
+            --cache-to type=gha,mode=max,scope=aqua-backend \
+            --sbom=true --provenance=mode=max --push \
+            --metadata-file backend-metadata.json .
+
+      - name: Build demo image
+        env:
+          REGISTRY: ghcr.io/aqua-monitoring
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          docker buildx build --pull --target demo -f Dockerfile.slim \
+            --tag "$REGISTRY/aqua-demo:$SHA" \
+            --cache-from type=gha,scope=aqua-demo \
+            --cache-to type=gha,mode=max,scope=aqua-demo \
+            --sbom=true --provenance=mode=max --push \
+            --metadata-file demo-metadata.json .
+
+      - name: Record digests
+        id: digests
+        env:
+          SHA: ${{ steps.release.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          backend_digest=$(jq -r '.["containerimage.digest"]' backend-metadata.json)
+          demo_digest=$(jq -r '.["containerimage.digest"]' demo-metadata.json)
+          [[ "$backend_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$demo_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "backend_digest=$backend_digest" >> "$GITHUB_OUTPUT"
+          echo "demo_digest=$demo_digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Aqua backend release"
+            echo "Commit: $SHA"
+            echo "Backend: $backend_digest"
+            echo "Demo: $demo_digest"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report result to Server Ops
+        if: ${{ always() }}
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          CALLBACK_BASE_URL: ${{ vars.SERVER_OPS_CALLBACK_URL }}
+          CALLBACK_TOKEN: ${{ secrets.SERVER_OPS_CI_CALLBACK_TOKEN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.SERVER_OPS_CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.SERVER_OPS_CF_ACCESS_CLIENT_SECRET }}
+          JOB_STATUS: ${{ job.status }}
+          REQUESTED_SHA: ${{ inputs.release_ref }}
+          RESOLVED_SHA: ${{ steps.release.outputs.sha }}
+          BACKEND_DIGEST: ${{ steps.digests.outputs.backend_digest }}
+          DEMO_DIGEST: ${{ steps.digests.outputs.demo_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CALLBACK_BASE_URL" || {
+            echo "SERVER_OPS_CALLBACK_URL is required" >&2
+            exit 1
+          }
+          test -n "$CALLBACK_TOKEN" || {
+            echo "SERVER_OPS_CI_CALLBACK_TOKEN is required" >&2
+            exit 1
+          }
+          [[ "$BUILD_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
+            echo "build_id must be a UUID" >&2
+            exit 1
+          }
+
+          if [[ "$JOB_STATUS" == "success" ]]; then
+            callback_status=SUCCEEDED
+            [[ "$RESOLVED_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]
+            [[ "$BACKEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+            [[ "$DEMO_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+            payload=$(printf \
+              '{"status":"%s","commit_sha":"%s","backend_digest":"%s","demo_digest":"%s","workflow_run_id":"%s"}' \
+              "$callback_status" "$RESOLVED_SHA" "$BACKEND_DIGEST" "$DEMO_DIGEST" "$GITHUB_RUN_ID")
+          else
+            callback_status=FAILED
+            callback_sha=${RESOLVED_SHA:-${REQUESTED_SHA,,}}
+            [[ "$callback_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]
+            payload=$(printf \
+              '{"status":"%s","commit_sha":"%s","workflow_run_id":"%s"}' \
+              "$callback_status" "$callback_sha" "$GITHUB_RUN_ID")
+          fi
+
+          callback_url="${CALLBACK_BASE_URL%/}/internal/v1/ci/builds/${BUILD_ID}/"
+          curl --fail --silent --show-error --output /dev/null \
+            --retry 3 --retry-delay 2 --retry-all-errors --max-time 30 \
+            --request POST \
+            --header "Authorization: Bearer $CALLBACK_TOKEN" \
+            --header "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+            --header "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+            --header "Content-Type: application/json" \
+            --data "$payload" \
+            "$callback_url"

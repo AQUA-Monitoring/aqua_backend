@@ -66,6 +66,10 @@ class FloodSpatialEventRevision(TimestampedModel):
     author = models.ForeignKey("users.User", null=True, blank=True, on_delete=models.PROTECT, related_name="flood_event_revisions")
     justification = models.TextField()
     source_revision = models.CharField(max_length=255)
+    reference_base_release = models.ForeignKey(
+        "addressing.ReferenceBaseRelease", null=True, blank=True,
+        on_delete=models.PROTECT, related_name="flood_impact_revisions",
+    )
 
     class Meta:
         constraints = [
@@ -78,9 +82,11 @@ class FloodSpatialEventRevision(TimestampedModel):
 
 class RoadFloodImpactRun(TimestampedModel):
     class Status(models.TextChoices):
+        QUEUED = "QUEUED", "Na fila"
         RUNNING = "RUNNING", "Executando"
         COMPLETED = "COMPLETED", "Concluído"
         FAILED = "FAILED", "Falhou"
+        STALE = "STALE", "Desatualizado"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     revision = models.ForeignKey(FloodSpatialEventRevision, on_delete=models.PROTECT, related_name="impact_runs")
@@ -91,11 +97,51 @@ class RoadFloodImpactRun(TimestampedModel):
     finished_at = models.DateTimeField(null=True, blank=True)
     report = models.JSONField(default=dict, blank=True)
     input_hash = models.CharField(max_length=64, db_index=True)
+    reference_base_release = models.ForeignKey(
+        "addressing.ReferenceBaseRelease", null=True, blank=True,
+        on_delete=models.PROTECT, related_name="flood_impact_runs",
+    )
+    reason = models.TextField(blank=True)
+    requested_by = models.ForeignKey(
+        "users.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="requested_road_impact_runs",
+    )
+
+class FloodImpactAdministrativeAction(TimestampedModel):
+    class Action(models.TextChoices):
+        PUBLISH = "PUBLISH", "Publicar"
+        REVOKE = "REVOKE", "Revogar"
+        CONFIRM = "CONFIRM", "Confirmar"
+        RECALCULATE = "RECALCULATE", "Recalcular"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    event = models.ForeignKey(
+        FloodSpatialEvent, on_delete=models.PROTECT, related_name="administrative_actions",
+    )
+    revision = models.ForeignKey(
+        FloodSpatialEventRevision, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="administrative_actions",
+    )
+    action = models.CharField(max_length=16, choices=Action.choices, db_index=True)
+    actor = models.ForeignKey(
+        "users.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="flood_impact_administrative_actions",
+    )
+    justification = models.TextField()
+    from_status = models.CharField(max_length=16, blank=True)
+    to_status = models.CharField(max_length=16, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    derived_event = models.ForeignKey(
+        FloodSpatialEvent, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="confirmation_actions",
+    )
+    impact_run = models.ForeignKey(
+        RoadFloodImpactRun, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="administrative_actions",
+    )
 
     class Meta:
-        constraints = [
-            models.UniqueConstraint(fields=["revision", "road_dataset", "algorithm_version"], name="uniq_road_impact_run"),
-        ]
+        indexes = [models.Index(fields=["event", "created_at"], name="flood_impac_event_action_idx")]
 
 
 class RoadFloodImpact(models.Model):

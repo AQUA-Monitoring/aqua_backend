@@ -34,6 +34,9 @@ from core.flood_camera_monitoring.services.model_artifact import (
     ModelArtifactInfo,
     inspect_model_artifact,
 )
+from core.flood_camera_monitoring.services.operational_alerts import (
+    create_or_update_alert_for_detection,
+)
 from core.flood_camera_monitoring.infra.models import (
     Camera,
     CameraOperationalSnapshot,
@@ -63,6 +66,11 @@ class AnalyzeAllCamerasService:
     stream_factory: Callable[[str], Any] = OpenCVVideoStream
     classifier_factory: Callable[[str], Any] = TorchFloodClassifier
     artifact_inspector: Callable[[], ModelArtifactInfo] = inspect_model_artifact
+    camera_id: Any = None
+    capture_observer: Any = None
+    prediction_observer: Any = None
+    drain_between_samples: bool = False
+    persist_legacy_images: bool = True
 
     def run(self) -> int:
         _, saved = self.run_and_collect()
@@ -76,7 +84,10 @@ class AnalyzeAllCamerasService:
         classifier_error_code: str | None = None
         artifact: ModelArtifactInfo | None = None
 
-        cameras = Camera.objects.filter(status=Camera.CameraStatus.ACTIVE).iterator()
+        cameras = Camera.objects.filter(status=Camera.CameraStatus.ACTIVE)
+        if self.camera_id is not None:
+            cameras = cameras.filter(pk=self.camera_id)
+        cameras = cameras.iterator()
         for camera in cameras:
             stream_url = getattr(camera, "video_hls", None)
             if self._is_demo_camera(camera, stream_url):
@@ -94,6 +105,8 @@ class AnalyzeAllCamerasService:
                 continue
 
             frames, capture_error = self._capture_frames(str(stream_url))
+            if self.capture_observer is not None:
+                self.capture_observer(camera, frames)
             if capture_error:
                 mark_error(
                     snapshot,
@@ -151,7 +164,9 @@ class AnalyzeAllCamerasService:
                 continue
 
             try:
-                summary, _ = aggregate_predictions(frames, classifier, self._eval_config())
+                summary, assessments = aggregate_predictions(frames, classifier, self._eval_config())
+                if self.prediction_observer is not None:
+                    self.prediction_observer(camera, summary, assessments)
             except Exception:
                 logger.exception("Inference failed for camera id=%s", camera.id)
                 mark_error(
@@ -180,7 +195,10 @@ class AnalyzeAllCamerasService:
                 CameraOperationalSnapshot.CameraClassification.FLOOD_INDICATION,
                 CameraOperationalSnapshot.CameraClassification.INTERMEDIATE_INDICATION,
             }:
-                if self._persist_detection(camera, frames, summary, classification):
+                if self._persist_detection(
+                    camera, snapshot, frames if self.persist_legacy_images else [],
+                    summary if self.persist_legacy_images else {**summary, 'chosen_bytes': None}, classification
+                ):
                     saved += 1
 
             data.append(snapshot_prediction_payload(camera, snapshot))
@@ -205,7 +223,13 @@ class AnalyzeAllCamerasService:
                 if frame:
                     frames.append(frame)
                 if index < attempts - 1 and self.sample_interval_ms > 0:
-                    time.sleep(self.sample_interval_ms / 1000.0)
+                    if self.drain_between_samples:
+                        deadline = time.monotonic() + self.sample_interval_ms / 1000.0
+                        while time.monotonic() < deadline:
+                            if stream.grab() is None:
+                                break
+                    else:
+                        time.sleep(self.sample_interval_ms / 1000.0)
         except Exception:
             logger.exception("Could not capture frames from an operational camera")
             return [], True
@@ -272,6 +296,7 @@ class AnalyzeAllCamerasService:
     @staticmethod
     def _persist_detection(
         camera,
+        snapshot: CameraOperationalSnapshot,
         frames: list[bytes],
         summary: dict[str, Any],
         classification: str,
@@ -297,7 +322,7 @@ class AnalyzeAllCamerasService:
         }
         try:
             with transaction.atomic():
-                FloodDetectionRecord.objects.create(
+                detection = FloodDetectionRecord.objects.create(
                     **values,
                     image=(
                         ContentFile(
@@ -308,6 +333,8 @@ class AnalyzeAllCamerasService:
                         else None
                     ),
                 )
+                if is_flooded:
+                    create_or_update_alert_for_detection(detection, snapshot)
             return True
         except Exception:
             logger.warning(
@@ -317,7 +344,9 @@ class AnalyzeAllCamerasService:
             )
         try:
             with transaction.atomic():
-                FloodDetectionRecord.objects.create(**values, image=None)
+                detection = FloodDetectionRecord.objects.create(**values, image=None)
+                if is_flooded:
+                    create_or_update_alert_for_detection(detection, snapshot)
             return True
         except Exception:
             logger.exception("Could not persist detection for camera id=%s", camera.id)
