@@ -2,6 +2,9 @@ from django.core.exceptions import ValidationError
 from django.db import models
 import uuid
 
+from .monitoring_models import (CameraMonitoringState, CameraAnalysisRun, CameraEvidence,
+    CameraReview, MonitoringAudit, FloodModelVersion, ModelShadowResult)
+
 from core.common.models import TimestampedModel
 
 

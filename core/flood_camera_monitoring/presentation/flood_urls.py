@@ -1,6 +1,7 @@
 """Full Flood Monitoring API; imported only by flood/full images."""
 
 from django.urls import path
+from .adaptive_views import MonitoringView, EvidenceView, ReviewView, ApproveReviewView, ModelsView, PromoteModelView, MonitoringHealthView
 
 from core.flood_camera_monitoring.presentation.demo_views import (
     DemoPredictionBatchView,
@@ -19,6 +20,13 @@ from core.flood_camera_monitoring.presentation.monitoring_views import FloodMoni
 
 
 urlpatterns = [
+    path('monitoring/health/', MonitoringHealthView.as_view()),
+    path('reviews/<uuid:review_id>/approve/', ApproveReviewView.as_view()),
+    path('models/', ModelsView.as_view()),
+    path('models/<uuid:model_id>/promote/', PromoteModelView.as_view()),
+    path('cameras/<uuid:camera_id>/monitoring/', MonitoringView.as_view()),
+    path('evidence/<uuid:evidence_id>/', EvidenceView.as_view()),
+    path('analyses/<uuid:run_id>/reviews/', ReviewView.as_view()),
     path(
         "stream/snapshot",
         FloodMonitoringViewSet.as_view({"post": "predict_snapshot"}),

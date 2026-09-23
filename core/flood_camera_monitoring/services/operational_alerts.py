@@ -228,6 +228,7 @@ def confirm_operational_alert(
     *,
     reason: str = "",
     on_published: PublicationCallback | None = None,
+    automatic: bool = False,
 ) -> AlertConfirmation:
     _require_admin(actor)
     with transaction.atomic():
@@ -263,8 +264,9 @@ def confirm_operational_alert(
         probabilities = evidence.get("probabilities") or {}
         publication = AlertPublication.objects.create(
             alert=alert,
-            title="Alagamento confirmado por administrador",
-            message=f"Alagamento confirmado por administrador na região {alert.region.name}.",
+            title="Indício de alagamento confirmado automaticamente" if automatic else "Alagamento confirmado por administrador",
+            message=(f"Indício de alagamento persistente com confirmação contextual na região {alert.region.name}."
+                     if automatic else f"Alagamento confirmado por administrador na região {alert.region.name}."),
             region=alert.region,
             camera=alert.camera,
             confirmed_by=actor,
@@ -280,7 +282,7 @@ def confirm_operational_alert(
             from_status=OperationalAlert.Status.OPEN_INDICATION,
             to_status=OperationalAlert.Status.CONFIRMED,
             actor=actor,
-            origin=OperationalAlertTransition.Origin.ADMIN,
+            origin=OperationalAlertTransition.Origin.CAMERA_ANALYSIS if automatic else OperationalAlertTransition.Origin.ADMIN,
             reason=reason,
         )
         if on_published is not None:

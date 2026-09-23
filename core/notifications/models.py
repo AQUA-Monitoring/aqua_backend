@@ -79,6 +79,7 @@ class NotificationEvent(models.Model):
     severity = models.CharField(max_length=16, choices=Severity.choices, default=Severity.ATTENTION)
     title = models.CharField(max_length=160)
     message = models.TextField(max_length=1000)
+    is_global = models.BooleanField(default=False)
     destination_url = models.CharField(max_length=500, blank=True)
     idempotency_key = models.CharField(max_length=180, unique=True)
     actor = models.ForeignKey("users.User", null=True, blank=True, on_delete=models.PROTECT, related_name="notification_events")

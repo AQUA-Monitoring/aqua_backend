@@ -129,14 +129,17 @@ class NotificationEventSerializer(serializers.ModelSerializer):
     class Meta:
         model = NotificationEvent
         fields = ("id", "origin", "status", "severity", "title", "message", "destination_url",
-                  "region_ids", "neighborhood_ids", "regions", "neighborhoods", "audience_count",
+                  "is_global", "region_ids", "neighborhood_ids", "regions", "neighborhoods", "audience_count",
                   "delivery_summary", "created_at", "published_at", "resolved_at")
         read_only_fields = ("id", "origin", "status", "audience_count", "created_at", "published_at", "resolved_at")
 
     def validate(self, attrs):
         regions = attrs.get("regions", getattr(self.instance, "regions", []).all() if self.instance else [])
         neighborhoods = attrs.get("neighborhoods", getattr(self.instance, "neighborhoods", []).all() if self.instance else [])
-        if not regions and not neighborhoods:
+        is_global = attrs.get("is_global", getattr(self.instance, "is_global", False))
+        if is_global and (regions or neighborhoods):
+            raise serializers.ValidationError("Comunicados globais não devem selecionar regiões ou bairros.")
+        if not is_global and not regions and not neighborhoods:
             raise serializers.ValidationError("Informe ao menos uma região ou bairro.")
         return attrs
 

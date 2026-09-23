@@ -83,6 +83,7 @@ def _camera_metadata_queryset():
         "neighborhood",
         "neighborhood__region",
         "operational_snapshot",
+        "monitoring",
         "created_by",
         "city",
         "region",

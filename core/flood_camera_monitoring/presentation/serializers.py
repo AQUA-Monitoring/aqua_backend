@@ -249,6 +249,7 @@ class CameraReadSerializer(serializers.Serializer):
     latitude = serializers.SerializerMethodField()
     longitude = serializers.SerializerMethodField()
     operational = serializers.SerializerMethodField()
+    monitoring = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
     created_by = serializers.SerializerMethodField()
@@ -318,6 +319,15 @@ class CameraReadSerializer(serializers.Serializer):
     @staticmethod
     def get_operational(camera):
         return build_operational_payload(camera)
+
+    @staticmethod
+    def get_monitoring(camera):
+        state = getattr(camera, 'monitoring', None)
+        if state is None:
+            return None
+        return {'level': state.level, 'reason': state.reason,
+            'next_analysis_at': state.next_analysis_at,
+            'strong_streak': state.strong_streak}
 
     @staticmethod
     def get_created_by(camera):

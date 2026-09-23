@@ -16,6 +16,7 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 media/
+backups/
 
 
 # Flood camera monitoring train data
@@ -64,4 +65,3 @@ site-packages/
 # Compiled/Python cache
 **/*.py[cod]
 **/*.so
-

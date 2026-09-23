@@ -6,6 +6,8 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from core.users.models import User
+
 from .adapters import PushDeliveryError, WebPushAdapter
 from .models import (
     NotificationEvent,
@@ -67,6 +69,7 @@ def schedule_publication_push(publication, event_kind: str) -> int:
 
 def _snapshot(event: NotificationEvent) -> dict:
     return {
+        "is_global": event.is_global,
         "regions": [
             {"id": str(item.id), "name": item.name} for item in event.regions.all()
         ],
@@ -92,6 +95,8 @@ def _nearby_user_ids(event: NotificationEvent) -> set:
 
 
 def event_recipient_user_ids(event: NotificationEvent) -> set:
+    if event.is_global:
+        return set(User.objects.filter(is_active=True).values_list("pk", flat=True))
     if event.origin == NotificationEvent.Origin.CAMERA and event.idempotency_key.endswith(":resolved"):
         original = NotificationEvent.objects.filter(
             idempotency_key=event.idempotency_key.removesuffix(":resolved") + ":confirmed"
@@ -136,7 +141,9 @@ def publish_event(event: NotificationEvent, *, actor=None) -> NotificationEvent:
             return event
         if event.status != NotificationEvent.Status.DRAFT:
             raise ValueError("Somente rascunhos podem ser publicados.")
-        if not event.regions.exists() and not event.neighborhoods.exists():
+        if event.is_global and (event.regions.exists() or event.neighborhoods.exists()):
+            raise ValueError("Comunicados globais não devem selecionar regiões ou bairros.")
+        if not event.is_global and not event.regions.exists() and not event.neighborhoods.exists():
             raise ValueError("Informe ao menos uma região ou bairro.")
         audience = preview_event_audience(event)
         event.status = NotificationEvent.Status.PUBLISHED

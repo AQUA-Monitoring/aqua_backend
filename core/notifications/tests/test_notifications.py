@@ -255,6 +255,49 @@ class UnifiedNotificationApiTests(NotificationFixture):
         self.assertEqual(PushDelivery.objects.filter(event=event).count(), 1)
         delay.assert_called_once()
 
+    @patch("core.notifications.tasks.deliver_push_batch_task.delay")
+    def test_global_event_reaches_active_users_without_territory_and_is_idempotent(self, delay):
+        inactive = User.objects.create(name="Inativo", email="inactive@example.test", is_active=False)
+        for user, suffix, active in [(self.user, "one", True), (self.user, "two", True),
+                                     (self.other_user, "disabled", False), (inactive, "inactive-user", True)]:
+            PushSubscription.objects.create(user=user, endpoint=f"https://push.example.test/{suffix}",
+                                            p256dh="key", auth="auth", is_active=active)
+        self.client.force_authenticate(self.admin)
+        response = self.client.post("/api/notification-events/", {
+            "title": "Aviso global", "message": "Aviso para todos.", "is_global": True,
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+        event = NotificationEvent.objects.get(pk=response.data["id"])
+        audience = {"users": User.objects.filter(is_active=True).count(), "devices": 2}
+        self.assertEqual(preview_event_audience(event), audience)
+        with self.captureOnCommitCallbacks(execute=True):
+            published = self.client.post(f"/api/notification-events/{event.id}/publish/")
+        self.assertEqual(published.status_code, 200)
+        self.assertTrue(published.data["is_global"])
+        self.assertEqual(PushDelivery.objects.filter(event=event).count(), 2)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(f"/api/notification-events/{event.id}/publish/")
+        self.assertEqual(PushDelivery.objects.filter(event=event).count(), 2)
+        event.refresh_from_db()
+        self.assertTrue(event.territory_snapshot["is_global"])
+        delay.assert_called_once()
+
+    def test_manual_event_requires_explicit_global_scope_or_territory(self):
+        self.client.force_authenticate(self.admin)
+        for scope in [{}, {"is_global": False},
+                      {"is_global": True, "region_ids": [str(self.region.id)]}]:
+            response = self.client.post("/api/notification-events/", {
+                "title": "Aviso", "message": "Mensagem", **scope,
+            }, format="json")
+            self.assertEqual(response.status_code, 400)
+
+    def test_standard_user_cannot_create_global_event(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.post("/api/notification-events/", {
+            "title": "Aviso", "message": "Mensagem", "is_global": True,
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
     def test_standard_user_cannot_manage_manual_events(self):
         self.client.force_authenticate(self.user)
         self.assertEqual(self.client.get("/api/notification-events/").status_code, 403)

@@ -270,6 +270,12 @@ FLOOD_ANALYSIS_STALE_SECONDS = int(
 from celery.schedules import crontab  # type: ignore
 
 CELERY_BEAT_SCHEDULE = {
+    'flood-adaptive-dispatch': {
+        'task': 'core.flood_camera_monitoring.tasks.dispatch_due_cameras', 'schedule': 10.0,
+    },
+    'flood-evidence-retention': {
+        'task': 'core.flood_camera_monitoring.tasks.expire_evidence', 'schedule': 3600.0,
+    },
     "flood-analyze-all-cameras": {
         "task": "core.flood_camera_monitoring.infra.tasks.analyze_all_cameras_task",
         "schedule": 300.00,
@@ -279,6 +285,19 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 300.00,
     },
 }
+
+FLOOD_ADAPTIVE_ENABLED = os.getenv('FLOOD_ADAPTIVE_ENABLED', '0') == '1'
+FLOOD_PRIVATE_EVIDENCE_ROOT = os.getenv('FLOOD_PRIVATE_EVIDENCE_ROOT', '/app/private_flood_evidence')
+FLOOD_AUTOPUBLISH_ENABLED = os.getenv('FLOOD_AUTOPUBLISH_ENABLED', '0') == '1'
+FLOOD_AUTOPUBLISH_ACTOR_ID = os.getenv('FLOOD_AUTOPUBLISH_ACTOR_ID', '')
+FLOOD_MODEL_REGISTRY_ROOT = os.getenv('FLOOD_MODEL_REGISTRY_ROOT', '/app/private_flood_models')
+FLOOD_REMOTE_PROVIDER_URL = os.getenv('FLOOD_REMOTE_PROVIDER_URL', '')
+FLOOD_REMOTE_PROVIDER_TOKEN = os.getenv('FLOOD_REMOTE_PROVIDER_TOKEN', '')
+if os.getenv('FLOOD_RETRAINING_ENABLED', '0') == '1':
+    CELERY_BEAT_SCHEDULE['flood-supervised-retraining'] = {
+        'task': 'core.flood_camera_monitoring.tasks.train_candidate', 'schedule': 86400.0,
+        'options': {'queue': 'flood_training'},
+    }
 
 # Web Push remains disabled until all VAPID values are supplied by the runtime.
 WEB_PUSH_VAPID_PUBLIC_KEY = os.getenv("WEB_PUSH_VAPID_PUBLIC_KEY", "").strip()
