@@ -1,22 +1,20 @@
 import requests
 
-def fill_current_weather(lat, lon):
+def future_weather_API(lat, lon, start, end):
     url = 'https://api.open-meteo.com/v1/forecast'
     params = {
         "latitude": lat,
         "longitude": lon,
+        "start_date": start,
+        "end_date": end,
         "hourly": ",".join([
+            "precipitation",
             "temperature_2m",
             "relative_humidity_2m",
-            "surface_pressure",
-            "precipitation",
-            "rain"
-        ]),
-        "forecast_days": 1,
-        "timezone": "America/Sao_Paulo"
+        ])
     }
 
     response = requests.get(url, params=params)
     data = response.json()
-    
+
     return data
