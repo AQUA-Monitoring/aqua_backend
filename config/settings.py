@@ -80,6 +80,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "corsheaders",
     "rest_framework",
+    "drf_spectacular",
     "django_celery_beat",
     "core",
     "core.users",
@@ -256,6 +257,12 @@ DEMO_STREAM_PUBLIC_URL = os.getenv(
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Aqua API",
+    "DESCRIPTION": "Documentação da API do backend Aqua.",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+}
 
 # Redis / Celery configuration (allow overrides from env)
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
@@ -357,6 +364,7 @@ REDIS_CACHE_URL = os.getenv("REDIS_CACHE_URL", "redis://redis:6379/2")
 
 # Django REST Framework
 REST_FRAMEWORK = {
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PAGINATION_CLASS": "config.pagination.DefaultPageNumberPagination",
     # Default page size, can be overridden via ?page_size= and capped by paginator
     "PAGE_SIZE": int(os.getenv("API_PAGE_SIZE", "20")),
