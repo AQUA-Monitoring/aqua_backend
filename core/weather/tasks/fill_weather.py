@@ -10,13 +10,11 @@ from core.weather.utils import process_weather
 def fill_weather(lat, lon, neighborhood, start, end):
     climates = []
     results = process_weather(lat, lon, start, end)
-    # debug: inspecionar estrutura retornada
     try:
         print("process_weather results keys:", [type(r) for r in results])
     except Exception:
         pass
 
-    # extrair valor de elevação (API open-elevation retorna {'results':[{'elevation': ...}]})
     elevation_value = None
     for r in results:
         if isinstance(r, dict) and 'results' in r and isinstance(r['results'], list) and r['results']:
@@ -24,8 +22,7 @@ def fill_weather(lat, lon, neighborhood, start, end):
             break
 
     for result in results:
-        if not isinstance(result, dict) or 'hourly' not in result:
-            # pular entradas sem dados horários (por ex. a resposta de elevação)
+        if not isinstance(result, dict) or 'hourly' not in result:   
             continue
 
         hourly = result.get("hourly") or {}
