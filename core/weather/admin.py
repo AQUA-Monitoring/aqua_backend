@@ -1,5 +1,5 @@
 from django.contrib import admin
-from core.weather.infra.models import Weather
+from core.weather.models import Weather
 
 @admin.register(Weather)
 class WeatherAdmin(admin.ModelAdmin):

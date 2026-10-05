@@ -1,4 +1,4 @@
-from core.weather.infra.models import Weather
+from core.weather.models import Weather
 from core.weather.infra.services.weather import fillClimate as fillClimateService, fillElevation, fillFutureClimate, fillFlood
 from datetime import date, timedelta
 

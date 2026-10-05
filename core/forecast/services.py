@@ -1,5 +1,5 @@
 from core.forecast.infra.models import Forecast
-from core.weather.infra.models import Weather
+from core.weather.models import Weather
 from core.occurrences.infra.models import Occurrence
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler

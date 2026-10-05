@@ -1,6 +1,6 @@
 from rest_framework.viewsets import ModelViewSet
 from rest_framework.decorators import action
-from core.weather.infra.models import Weather
+from core.weather.models import Weather
 from core.weather.presentation.serializers.WeatherModelSerializer import (
     WeatherModelSerializer,
 )
