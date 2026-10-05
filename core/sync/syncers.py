@@ -14,7 +14,7 @@ from core.forecast.infra.models import Forecast
 from core.occurrences.infra.models import Occurrence
 from core.users.infra.models import User
 from core.uploader.models import Document, Image
-from core.weather.infra.models import Weather
+from core.weather.models import Weather
 from core.sync.client import fetch_file
 
 logger = logging.getLogger(__name__)
