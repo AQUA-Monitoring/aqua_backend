@@ -1,5 +1,5 @@
 from core.weather.utils.process_coordinates import process_coordinates
-from core.weather.tasks.fill_weather import fill_weather
+from core.weather.presentation.tasks import fill_weather
 
 class WeatherService:
     @staticmethod

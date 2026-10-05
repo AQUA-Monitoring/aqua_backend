@@ -1,7 +1,7 @@
 from rest_framework import views, status
 from rest_framework.response import Response
 from core.weather.presentation.serializers import WeatherModelSerializer, WeatherFillSerializer
-from core.weather.services.weather import WeatherService
+from core.weather.services import WeatherService
 
 class WeatherAPIView(views.APIView):
     def post(self, request, *args, **kwargs):
