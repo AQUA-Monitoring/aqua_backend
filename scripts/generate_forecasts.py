@@ -1,7 +1,7 @@
 from datetime import date, timedelta
 import random
 
-from core.forecast.infra.models import Forecast
+from core.forecast.models import Forecast
 
 Forecast.objects.all().delete()
 

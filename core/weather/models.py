@@ -1,7 +1,7 @@
 from django.db import models
 
 class Weather(models.Model):
-    date = models.DateTimeField()
+    datetime = models.DateTimeField()
     latitude = models.FloatField()
     longitude = models.FloatField()
     neighborhood = models.CharField(max_length=20)
@@ -14,4 +14,4 @@ class Weather(models.Model):
     river_discharge = models.FloatField(null=True, blank=True)
 
     def __str__(self):
-        return f'{self.neighborhood} - {self.date}'
+        return f'{self.neighborhood} - {self.datetime}'

@@ -41,7 +41,7 @@ def fill_weather(lat, lon, neighborhood, start, end):
 
             climates.append(
                 Weather(
-                    date=date_value,
+                    datetime=date_value,
                     neighborhood=neighborhood,
                     latitude=float(lat),
                     longitude=float(lon),

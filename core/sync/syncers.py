@@ -10,7 +10,7 @@ from core.addressing.models import City, Neighborhood, Region
 from core.blog.infra.models import Post
 from core.flood_camera_monitoring.infra.models import Camera
 from core.flood_point_registering.infra.models import Flood_Point_Register
-from core.forecast.infra.models import Forecast
+from core.forecast.models import Forecast
 from core.occurrences.infra.models import Occurrence
 from core.users.infra.models import User
 from core.uploader.models import Document, Image
@@ -406,7 +406,7 @@ def sync_weather(data: list, token: str) -> tuple[int, int]:
                 pass
 
         _, was_created = Weather.objects.update_or_create(
-            date=date_val,
+            datetime=date_val,
             latitude=lat,
             longitude=lon,
             neighborhood=neighborhood,

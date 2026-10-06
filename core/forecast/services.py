@@ -1,6 +1,6 @@
-from core.forecast.infra.models import Forecast
+from core.forecast.models import Forecast
 from core.weather.models import Weather
-from core.occurrences.infra.models import Occurrence
+from core.occurrences.models import Occurrence
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -16,12 +16,12 @@ class ForecastRepoImpl:
     def getWeatherByCoord(self, lat, lon):
         return Weather.objects.filter(latitude=lat, longitude=lon)
 
-    def forecast(self, lat, lon, flood, date, probability):
+    def forecast(self, lat, lon, flood, datetime, probability):
         Forecast.objects.update_or_create(
             latitude=lat,
             longitude=lon,
             flood=flood,
-            date=date,
+            datetime=datetime,
             probability=probability,
         )
 
@@ -32,7 +32,7 @@ def floodingPredict(repo):
 
 def runForecast(repo): # Aqui é onde realmente acontece a previsão com IA
     # Treinamento
-    occurrence_qs = Occurrence.objects.all().values("date", "neighborhood")
+    occurrence_qs = Occurrence.objects.all().values("datetime", "neighborhood")
     occurrences = pd.DataFrame(list(occurrence_qs))
     conditions = []
     coords = repo.getCoords()
@@ -41,13 +41,13 @@ def runForecast(repo): # Aqui é onde realmente acontece a previsão com IA
         weather = repo.getWeatherByCoord(coord["latitude"], coord["longitude"])
         for data in weather:
             if None not in (
-                data.latitude, data.longitude, data.neighborhood, data.date, data.rain, data.temperature, data.humidity, data.elevation, data.pressure
+                data.latitude, data.longitude, data.neighborhood, data.datetime, data.rain, data.temperature, data.humidity, data.elevation, data.pressure
             ):
                 conditions.append([
                     data.latitude, 
                     data.longitude,
                     data.neighborhood, 
-                    data.date,
+                    data.datetime,
                     data.rain, 
                     data.temperature, 
                     data.humidity, 
@@ -56,14 +56,12 @@ def runForecast(repo): # Aqui é onde realmente acontece a previsão com IA
                 ])
 
     print("Conditions: ", len(conditions))
-    df_weather = pd.DataFrame(conditions, columns=["latitude", "longitude", "neighborhood", "date", "rain", "temperature", "humidity", "elevation", "pressure"])
-    occurrences["date"] = pd.to_datetime(occurrences["date"]).dt.date
-    df_weather["date"] = pd.to_datetime(df_weather["date"]).dt.date
+    df_weather = pd.DataFrame(conditions, columns=["latitude", "longitude", "neighborhood", "datetime", "rain", "temperature", "humidity", "elevation", "pressure"])
 
     df = pd.merge(
         df_weather,
         occurrences,
-        on=["neighborhood", "date"],
+        on=["neighborhood", "datetime"],
         how="left",
         suffixes=("", "_occurrence")
     )
@@ -71,7 +69,7 @@ def runForecast(repo): # Aqui é onde realmente acontece a previsão com IA
     #occurrence_renamed = occurrences.rename(columns={"date": "date_flood"})
     df["flood"] = df.apply(
         lambda row: 1 if ((occurrences["neighborhood"] == row["neighborhood"]) & 
-                          (occurrences["date"] == row["date"])).any() or 
+                          (occurrences["datetime"] == row["datetime"])).any() or 
                           (row.rain > 10 and row.humidity > 60 and row.elevation < 10)
                           else 0,
         axis=1
@@ -98,9 +96,17 @@ def runForecast(repo): # Aqui é onde realmente acontece a previsão com IA
     clf.fit(X_res, Y_res)
 
     # Previsão
-    df["date"] = pd.to_datetime(df["date"])
-    today = pd.Timestamp.today().normalize()
-    df_future = df[df["date"] >= today - pd.Timedelta(days=7)]
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df = df.dropna(subset=["datetime", "rain", "temperature", "humidity", "pressure", "elevation"]).copy()
+
+    if df.empty:
+        return
+
+    cutoff = df["datetime"].max() - pd.Timedelta(days=7)
+    df_future = df[df["datetime"] >= cutoff].copy()
+
+    if df_future.empty:
+        df_future = df.copy()
 
     X_future = df_future[features].values
     X_future_scaled = scaler.transform(X_future)
@@ -110,7 +116,7 @@ def runForecast(repo): # Aqui é onde realmente acontece a previsão com IA
 
     for i, row in enumerate(df_future.itertuples(index=False)):
         Forecast.objects.update_or_create(
-            date = row.date,
+            datetime = row.datetime,
             latitude = row.latitude,
             longitude = row.longitude,
             flood = int(Y_predict[i]),
