@@ -1,7 +1,7 @@
 from django.contrib import admin
-from core.occurrences.infra.models import Occurrence
+from core.occurrences.models import Occurrence
 
 @admin.register(Occurrence)
 class Occurrence(admin.ModelAdmin):
-    list_display = ('date', 'neighborhood')
-    search_fields = ("neighborhood",)
+    list_display = ('datetime',)
+    #search_fields = ("neighborhood",)
