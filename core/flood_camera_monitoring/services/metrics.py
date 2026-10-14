@@ -245,6 +245,7 @@ def build_camera_ml_metrics_registry(*, now: datetime | None = None) -> Collecto
         max(stream_ages) if stream_ages else math.nan
     )
 
+    add_monitoring_metrics(registry, collected_at)
     return registry
 
 
@@ -262,3 +263,48 @@ def render_collection_failure_metrics() -> bytes:
     )
     collection_success.labels(scope=SCOPE_OPERATIONAL).set(0)
     return generate_latest(registry)
+
+
+def add_monitoring_metrics(registry, now):
+    from core.flood_camera_monitoring.infra.models import CameraMonitoringState
+    from .monitoring_capacity import capacity_snapshot
+    from .adaptive_monitoring import queue_for
+
+    levels = ('NORMAL', 'WATCH', 'CRITICAL', 'RECOVERY')
+    queues = ('flood_regular', 'flood_critical')
+    deferred, leases = Counter(), Counter()
+    delays = {level: 0.0 for level in levels}
+    for state in CameraMonitoringState.objects.values('level', 'next_analysis_at', 'lease_until',
+            'lease_queue', 'lease_started_at', 'capacity_deferred_at', 'camera__status').iterator():
+        leased = state['lease_until'] and state['lease_until'] > now
+        if leased:
+            queue = state['lease_queue'] or queue_for(state['level'])
+            leases[(queue, 'running' if state['lease_started_at'] else 'pending')] += 1
+        if state['level'] not in levels or state['camera__status'] != 1:
+            continue
+        if not leased:
+            delay = max(0, (now - state['next_analysis_at']).total_seconds())
+            delays[state['level']] = max(delays[state['level']], delay)
+            if delay > 0 and state['capacity_deferred_at']:
+                deferred[state['level']] += 1
+    metric = Gauge('aqua_monitoring_deferred_cameras', 'Currently overdue cameras deferred by admission control.',
+                   ('level',), registry=registry)
+    delay_metric = Gauge('aqua_monitoring_dispatch_overdue_seconds', 'Maximum current dispatch delay by level.',
+                         ('level',), registry=registry)
+    for level in levels:
+        metric.labels(level).set(deferred[level])
+        delay_metric.labels(level).set(delays[level])
+    active = Gauge('aqua_monitoring_reservations', 'Unexpired pending and running reservations.',
+                   ('queue', 'state'), registry=registry)
+    for queue in queues:
+        for status in ('pending', 'running'):
+            active.labels(queue, status).set(leases[(queue, status)])
+    capacity = capacity_snapshot()
+    Gauge('aqua_monitoring_capacity_limit', 'Allowed simultaneous reservations per queue.',
+          registry=registry).set(capacity['limit_per_queue'])
+    Gauge('aqua_monitoring_telemetry_available', 'One when a complete fresh telemetry window is available.',
+          registry=registry).set(capacity['status'] in {'NORMAL', 'LIMITED', 'SUSPENDED'})
+    Gauge('aqua_monitoring_host_cpu_percent', 'Host CPU pressure over the last minute; NaN when unavailable.',
+          registry=registry).set(capacity.get('cpu_percent') if capacity.get('cpu_percent') is not None else math.nan)
+    Gauge('aqua_monitoring_host_memory_available_bytes', 'Host available memory; NaN when unavailable.',
+          registry=registry).set(capacity.get('available_bytes') if capacity.get('available_bytes') is not None else math.nan)

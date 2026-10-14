@@ -162,6 +162,7 @@ class TorchFloodClassifier:
         elif ckpt is not None:
             config = ckpt.get("config", {"model_name": "resnet50", "num_classes": 2})
             self.class_names = ckpt.get("class_names", ["normal", "flooded"])
+            self.checkpoint_config = dict(config)
             model_name = str(config.get("model_name", "resnet50"))
             num_classes = len(self.class_names)
             try:

@@ -28,6 +28,11 @@ class CameraMonitoringState(models.Model):
     context_until = models.DateTimeField(null=True)
     lease_token = models.UUIDField(null=True)
     lease_until = models.DateTimeField(null=True)
+    lease_queue = models.CharField(max_length=20, blank=True, default='')
+    lease_reserved_at = models.DateTimeField(null=True)
+    lease_started_at = models.DateTimeField(null=True)
+    capacity_deferred_at = models.DateTimeField(null=True)
+    policy_version = models.CharField(max_length=100, blank=True, default='')
 
 
 class CameraAnalysisRun(ImmutableRecord):
@@ -42,6 +47,10 @@ class CameraAnalysisRun(ImmutableRecord):
     context = models.JSONField(default=dict)
     latency_ms = models.PositiveIntegerField(default=0)
     error_code = models.CharField(max_length=80, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['camera', '-started_at'], name='camera_run_latest_idx'),
+                   models.Index(fields=['started_at'], name='analysis_curation_time_idx')]
 
 
 class CameraEvidence(models.Model):

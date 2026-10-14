@@ -7,6 +7,7 @@ from .views import NotificationEventViewSet, OperationalAlertViewSet, PushSubscr
 region_list = RegionSubscriptionViewSet.as_view(
     {"get": "list", "post": "create", "delete": "destroy_collection"}
 )
+region_follow_all = RegionSubscriptionViewSet.as_view({"post": "follow_all"})
 push_create = PushSubscriptionViewSet.as_view(
     {"post": "create", "delete": "destroy_collection"}
 )
@@ -18,6 +19,7 @@ alert_resolve = OperationalAlertViewSet.as_view({"post": "resolve"})
 
 urlpatterns = [
     path("region-subscriptions/", region_list, name="region-subscription-list"),
+    path("region-subscriptions/follow-all/", region_follow_all, name="region-subscription-follow-all"),
     path("push-subscriptions/", push_create, name="push-subscription-create"),
     path("push-subscriptions/config/", push_config, name="push-subscription-config"),
     path("operational-alerts/", alert_list, name="operational-alert-list"),

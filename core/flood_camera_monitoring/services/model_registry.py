@@ -95,47 +95,31 @@ class ONNXProvider:
 def promotion_errors(metrics, baseline=None):
     errors = []
     if metrics.get('test_count', 0) < 100 or metrics.get('flood_count', 0) < 30:
-        errors.append('Insufficient held-out dataset: require 100 examples including 30 floods')
+        errors.append('O teste precisa de 100 exemplos, incluindo 30 de alagamento.')
     if not metrics.get('split_by_event') or metrics.get('leakage_detected', True):
-        errors.append('Event-isolated split and leakage audit required')
-    if metrics.get('recall', 0) < max(.95, (baseline or {}).get('recall', 0)):
-        errors.append('Flood recall regression or recall below 95%')
-    if metrics.get('precision', 0) < .9:
-        errors.append('Precision below 90%')
+        errors.append('É necessária separação por evento e verificação de vazamento de dados.')
+    if (metrics.get('recall') or 0) < max(.95, (baseline or {}).get('recall') or 0):
+        errors.append('Sensibilidade para alagamento abaixo de 95% ou inferior à referência.')
+    if (metrics.get('precision') or 0) < .9:
+        errors.append('Precisão para alagamento abaixo de 90%.')
     if not metrics.get('terminal_central_passed'):
-        errors.append('Terminal Central regression missing or failing')
+        errors.append('Cenário obrigatório do Terminal Central ausente ou com regressão.')
     if not metrics.get('slices'):
-        errors.append('Camera and environmental slice evaluation required')
+        errors.append('Faltam recortes por câmera e período com amostra suficiente.')
     if set((baseline or {}).get('slices', {})) - set(metrics.get('slices', {})):
-        errors.append('Candidate evaluation omits baseline slices')
+        errors.append('A avaliação omite recortes presentes na referência.')
     for name, values in metrics.get('slices', {}).items():
         previous = (baseline or {}).get('slices', {}).get(name, {})
         if values.get('recall', 0) < max(.9, previous.get('recall', 0)):
-            errors.append(f'Slice recall regression: {name}')
+            errors.append(f'Regressão de sensibilidade no recorte: {name}')
     return errors
 
 
 def promote_model(version_id, actor):
+    # Legacy endpoint uses the same comparison and pilot gates as the new panel.
+    import uuid
+    from .model_lifecycle import deploy
     if not actor or not actor.is_active or not (actor.is_superuser or actor.is_staff or actor.type == 'admin'):
         raise ValidationError('Active administrator required')
-    with transaction.atomic():
-        # Serialize promotion even when no champion exists.
-        from django.db import connection
-        with connection.cursor() as cursor:
-            cursor.execute('SELECT pg_advisory_xact_lock(%s)', [84710301])
-        candidate = FloodModelVersion.objects.select_for_update().get(pk=version_id)
-        if candidate.status not in ('shadow', 'retired'):
-            raise ValidationError('Candidate must complete shadow evaluation first')
-        from core.flood_camera_monitoring.infra.models import ModelShadowResult
-        if ModelShadowResult.objects.filter(model=candidate, error_code='').count() < 30:
-            raise ValidationError('At least 30 successful shadow windows required')
-        champion = FloodModelVersion.objects.filter(status='champion').first()
-        errors = promotion_errors(candidate.metrics, champion.metrics if champion else None)
-        if errors:
-            raise ValidationError(errors)
-        load_provider(candidate)
-        FloodModelVersion.objects.filter(status='champion').update(status='retired')
-        candidate.status = 'champion'
-        candidate.approved_by = actor
-        candidate.save(update_fields=['status', 'approved_by'])
-        return candidate
+    deployment = deploy(version_id, actor, 'EXPAND', 'Aplicação pelo endpoint administrativo legado', uuid.uuid4())
+    return deployment.target

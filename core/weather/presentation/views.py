@@ -10,3 +10,12 @@ class WeatherAPIView(views.APIView):
         data = serializer.validated_data
         weather = WeatherService.fill_climate(data.get("start"), data.get("end"))
         return Response(weather, status=status.HTTP_200_OK)
+
+from rest_framework.viewsets import ReadOnlyModelViewSet
+from core.weather.models import Weather
+
+
+class WeatherViewSet(ReadOnlyModelViewSet):
+    """Keep the existing weather export endpoint available to synchronization."""
+    queryset = Weather.objects.order_by("datetime", "pk")
+    serializer_class = WeatherModelSerializer

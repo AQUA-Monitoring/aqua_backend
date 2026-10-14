@@ -96,6 +96,21 @@ class AnalyzeAllCamerasService:
                 )
                 continue
 
+            # Pin the resolved model before capture; an in-flight run keeps this version.
+            from .model_lifecycle import operational_version
+            from .model_registry import verify_artifact, load_provider
+            version = operational_version(camera.pk)
+            artifact = None
+            classifier = None
+            classifier_resolved = False
+            classifier_error_code = None
+            if version:
+                try:
+                    artifact = ModelArtifactInfo(True, verify_artifact(version), version.sha256, None)
+                    classifier = load_provider(version)
+                    classifier_resolved = True
+                except Exception:
+                    artifact = ModelArtifactInfo(False, None, version.sha256, 'MODEL_INVALID')
             snapshot = get_or_create_operational_snapshot(camera)
             begin_capture(snapshot)
 

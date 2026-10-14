@@ -19,7 +19,20 @@ from core.flood_camera_monitoring.presentation.health_views import HealthcheckVi
 from core.flood_camera_monitoring.presentation.monitoring_views import FloodMonitoringViewSet
 
 
+from .intelligence_views import (EpisodesView, EpisodeView, LabelView, CuratedImageView,
+    LearningView, DatasetsView, JobsView, JobView, VersionsView, VersionActionView)
+
 urlpatterns = [
+    path('intelligence/episodes/', EpisodesView.as_view()),
+    path('intelligence/episodes/<uuid:episode_id>/', EpisodeView.as_view()),
+    path('intelligence/selections/<uuid:selection_id>/labels/', LabelView.as_view()),
+    path('intelligence/images/<str:digest>/', CuratedImageView.as_view()),
+    path('intelligence/learning/', LearningView.as_view()),
+    path('intelligence/datasets/', DatasetsView.as_view()),
+    path('intelligence/jobs/', JobsView.as_view()),
+    path('intelligence/jobs/<uuid:job_id>/', JobView.as_view()),
+    path('intelligence/models/', VersionsView.as_view()),
+    path('intelligence/models/<uuid:version_id>/actions/', VersionActionView.as_view()),
     path('monitoring/health/', MonitoringHealthView.as_view()),
     path('reviews/<uuid:review_id>/approve/', ApproveReviewView.as_view()),
     path('models/', ModelsView.as_view()),

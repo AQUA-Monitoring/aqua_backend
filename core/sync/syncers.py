@@ -5,13 +5,15 @@ from uuid import UUID
 
 from django.core.files.base import ContentFile
 from django.utils.dateparse import parse_date, parse_datetime
+from django.utils import timezone
+from datetime import datetime, time
 
 from core.addressing.models import City, Neighborhood, Region
 from core.blog.infra.models import Post
 from core.flood_camera_monitoring.infra.models import Camera
 from core.flood_point_registering.infra.models import Flood_Point_Register
 from core.forecast.models import Forecast
-from core.occurrences.infra.models import Occurrence
+from core.occurrences.models import Occurrence
 from core.users.infra.models import User
 from core.uploader.models import Document, Image
 from core.weather.models import Weather
@@ -50,6 +52,18 @@ def _maybe_date(value: str | None):
         return parsed
     parsed_dt = parse_datetime(str(value))
     return parsed_dt.date() if parsed_dt else None
+
+
+def _maybe_datetime(value):
+    if not value:
+        return None
+    parsed = parse_datetime(str(value))
+    if parsed is None:
+        day = parse_date(str(value))
+        parsed = datetime.combine(day, time.min) if day else None
+    if parsed is not None and timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed)
+    return parsed
 
 
 def _resolve_status(status_value: str | int | None, mapping: dict[str, int]) -> int | None:
@@ -312,7 +326,7 @@ def sync_occurrences(data: list, token: str) -> tuple[int, int]:
     created = 0
     updated = 0
     for item in data:
-        date_val = _maybe_date(item.get("date"))
+        date_val = _maybe_datetime(item.get("datetime") or item.get("date"))
         if not date_val:
             continue
 
@@ -325,8 +339,8 @@ def sync_occurrences(data: list, token: str) -> tuple[int, int]:
             situation_int = 4
 
         obj, was_created = Occurrence.objects.get_or_create(
-            date=date_val,
-            type=(item.get("type") or "").strip(),
+            datetime=date_val,
+            type=int(item.get("type") or 1),
             neighborhood=(item.get("neighborhood") or "").strip(),
             defaults={"situation": situation_int},
         )
@@ -380,7 +394,7 @@ def sync_weather(data: list, token: str) -> tuple[int, int]:
     created = 0
     updated = 0
     for item in data:
-        date_val = _maybe_date(item.get("date"))
+        date_val = _maybe_datetime(item.get("datetime") or item.get("date"))
         lat = item.get("latitude")
         lon = item.get("longitude")
         neighborhood = (item.get("neighborhood") or "").strip()
@@ -395,15 +409,6 @@ def sync_weather(data: list, token: str) -> tuple[int, int]:
             "pressure": item.get("pressure"),
             "river_discharge": item.get("river_discharge"),
         }
-
-        occ_id = item.get("occurrence")
-        if occ_id is not None:
-            try:
-                occ = Occurrence.objects.filter(id=occ_id).first()
-                if occ:
-                    defaults["occurrence"] = occ
-            except (ValueError, TypeError):
-                pass
 
         _, was_created = Weather.objects.update_or_create(
             datetime=date_val,
@@ -423,7 +428,7 @@ def sync_forecasts(data: list, token: str) -> tuple[int, int]:
     created = 0
     updated = 0
     for item in data:
-        date_val = _maybe_date(item.get("date"))
+        date_val = _maybe_datetime(item.get("datetime") or item.get("date"))
         lat = item.get("latitude")
         lon = item.get("longitude")
         if not date_val or lat is None or lon is None:
@@ -437,7 +442,7 @@ def sync_forecasts(data: list, token: str) -> tuple[int, int]:
         _, was_created = Forecast.objects.update_or_create(
             latitude=lat,
             longitude=lon,
-            date=date_val,
+            datetime=date_val,
             defaults=defaults,
         )
         if was_created:

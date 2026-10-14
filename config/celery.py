@@ -13,7 +13,7 @@ app.conf.broker_url = os.environ.get("CELERY_BROKER_URL")
 app.conf.result_backend = os.environ.get("CELERY_RESULT_BACKEND")
 app.conf.timezone = os.environ.get("TZ", "America/Sao_Paulo")
 
-app.conf.beat_scheduler = "django_celery_beat.schedulers:DatabaseScheduler"
+app.conf.beat_scheduler = "config.monitoring_scheduler:MonitoringDatabaseScheduler"
 
 # Fallback: se migrações do django_celery_beat não foram aplicadas ainda, evita crash do beat
 try:
@@ -29,7 +29,7 @@ try:
         logging.getLogger(__name__).warning(
             "Tabelas django_celery_beat ausentes. Usando scheduler em memória padrão até aplicar as migrações."
         )
-        app.conf.beat_scheduler = "celery.beat:PersistentScheduler"
+        app.conf.beat_scheduler = "config.monitoring_scheduler:MonitoringPersistentScheduler"
 except Exception:  # pragma: no cover - proteção defensiva
     pass
 

@@ -49,7 +49,10 @@ class FloodMonitoringViewSet(SafeOrderingMixin, viewsets.ViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        clf = build_default_classifier()
+        from core.flood_camera_monitoring.services.model_lifecycle import operational_version, compatible
+        camera = Camera.objects.filter(video_hls=data['stream_url']).first()
+        version = operational_version(camera.pk if camera else None)
+        clf = compatible(version) if version else build_default_classifier()
         stream = OpenCVVideoStream(data["stream_url"])  # implements VideoStreamPort
         try:
             res = predict_snapshot(
@@ -63,7 +66,9 @@ class FloodMonitoringViewSet(SafeOrderingMixin, viewsets.ViewSet):
                 status=status.HTTP_504_GATEWAY_TIMEOUT,
             )
 
-        return Response(build_prediction_payload(res))
+        payload = build_prediction_payload(res)
+        payload['model_version'] = version.sha256 if version else None
+        return Response(payload)
 
     @action(detail=False, methods=["post"], url_path="predict/batch")
     def predict_batch(self, request):
@@ -81,7 +86,10 @@ class FloodMonitoringViewSet(SafeOrderingMixin, viewsets.ViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        clf = build_default_classifier()
+        from core.flood_camera_monitoring.services.model_lifecycle import operational_version, compatible
+        camera = Camera.objects.filter(video_hls=data['stream_url']).first()
+        version = operational_version(camera.pk if camera else None)
+        clf = compatible(version) if version else build_default_classifier()
         stream = OpenCVVideoStream(data["stream_url"])  # VideoStreamPort
         results = [
             build_prediction_payload(res)
@@ -93,7 +101,7 @@ class FloodMonitoringViewSet(SafeOrderingMixin, viewsets.ViewSet):
             )
         ]
 
-        return Response({"results": results})
+        return Response({"results": results, "model_version": version.sha256 if version else None})
 
     @action(detail=False, methods=["post"], url_path="analyze/all")
     def analyze_all(self, request):

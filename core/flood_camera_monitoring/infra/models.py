@@ -317,3 +317,7 @@ class AlertPublication(models.Model):
 
     def delete(self, *args, **kwargs):
         raise ValidationError("Alert publications are immutable")
+
+from .intelligence_models import (ReviewEpisode, EpisodeObservation, CuratedImage, EpisodeImage,
+    ImageLabel, LearningDataset, TrainingJob, ModelEvaluation, ModelAssignment, ModelDeployment,
+    ShadowSession, ShadowWindow)

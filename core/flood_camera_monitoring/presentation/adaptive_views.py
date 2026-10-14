@@ -34,7 +34,8 @@ class MonitoringView(APIView):
     def get(self, request, camera_id):
         get_object_or_404(Camera, pk=camera_id)
         state = CameraMonitoringState.objects.filter(pk=camera_id).values(
-            'level', 'reason', 'next_analysis_at', 'strong_streak', 'clear_streak', 'lease_until').first()
+            'level', 'reason', 'next_analysis_at', 'strong_streak', 'clear_streak', 'lease_until',
+            'lease_started_at', 'capacity_deferred_at').first()
         runs = []
         for run in CameraAnalysisRun.objects.filter(camera_id=camera_id).prefetch_related('evidence', 'reviews').order_by('-started_at')[:50]:
             evidence = []
@@ -49,7 +50,9 @@ class MonitoringView(APIView):
                 'context': run.context, 'model_version': run.model_version, 'latency_ms': run.latency_ms,
                 'error_code': run.error_code, 'evidence': evidence,
                 'reviews': list(run.reviews.values('id', 'classification', 'reason', 'approved', 'created_at'))})
-        return Response({'monitoring': state, 'runs': runs})
+        from core.flood_camera_monitoring.services.monitoring_projection import monitoring_projection
+        state, capacity = monitoring_projection(camera_id, state, runs[0] if runs else None, timezone.now())
+        return Response({'monitoring': state, 'runs': runs, 'capacity': capacity})
 
     def post(self, request, camera_id):
         camera = get_object_or_404(Camera, pk=camera_id, status=1)
@@ -60,6 +63,7 @@ class MonitoringView(APIView):
             state = CameraMonitoringState.objects.select_for_update().get(pk=camera_id)
             state.level = data.validated_data['level']
             state.reason = 'MANUAL'
+            state.strong_streak = state.clear_streak = 0
             state.manual_until = timezone.now() + timedelta(minutes=data.validated_data['minutes'])
             state.next_analysis_at = timezone.now()
             state.save()

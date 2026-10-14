@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
+from django.db import transaction
 from django.db.models import Count, Q
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -7,6 +8,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from core.users.permissions import IsAppAdmin
+from core.addressing.models import Region
 
 from .models import NotificationEvent, NotificationEventAudit, PushSubscription, RegionSubscription, SavedPlace
 from .serializers import (
@@ -29,7 +31,7 @@ class RegionSubscriptionViewSet(viewsets.ViewSet):
 
     def list(self, request):
         queryset = RegionSubscription.objects.filter(user=request.user).select_related(
-            "region__city_ref"
+            "region__city_ref", "neighborhood"
         )
         from config.pagination import DefaultPageNumberPagination
 
@@ -47,6 +49,16 @@ class RegionSubscriptionViewSet(viewsets.ViewSet):
             output.data,
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
+
+    def follow_all(self, request):
+        """Follow the current active region catalog without changing neighborhood choices."""
+        with transaction.atomic():
+            region_ids = list(Region.objects.filter(is_active=True).values_list("id", flat=True))
+            RegionSubscription.objects.bulk_create(
+                [RegionSubscription(user=request.user, region_id=region_id) for region_id in region_ids],
+                ignore_conflicts=True,
+            )
+        return Response({"regions_count": len(region_ids)})
 
     def destroy_collection(self, request):
         serializer = RegionSubscriptionDeleteSerializer(data=request.query_params)

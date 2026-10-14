@@ -39,7 +39,7 @@ python-crontab==3.3.0
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.8.0+cpu
 torchvision==0.23.0+cpu
-scikit-learn==1.7.1
+scikit-learn==1.9.1
 imbalanced-learn==0.14.0
 numpy==2.2.6
 scipy==1.16.1

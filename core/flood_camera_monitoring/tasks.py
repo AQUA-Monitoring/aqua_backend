@@ -9,20 +9,28 @@ from django.conf import settings
 def dispatch_due_cameras():
     if not getattr(settings, 'FLOOD_ADAPTIVE_ENABLED', False):
         return 0
-    from .services.adaptive_monitoring import reserve_due
+    from .services.adaptive_monitoring import reserve_due, release_reservation
     reserved = reserve_due()
+    dispatched = 0
     for camera_id, token, level in reserved:
-        analyze_camera_task.apply_async(args=[camera_id, token],
-            queue='flood_critical' if level in ('WATCH', 'CRITICAL') else 'flood_regular', expires=120)
-    return len(reserved)
+        try:
+            analyze_camera_task.apply_async(args=[camera_id, token],
+                queue='flood_critical' if level in ('WATCH', 'CRITICAL') else 'flood_regular', expires=120)
+            dispatched += 1
+        except Exception:
+            release_reservation(camera_id, token)
+            logging.getLogger(__name__).exception('Unable to dispatch camera analysis')
+    return dispatched
 
 
 @shared_task(name='core.flood_camera_monitoring.tasks.analyze_camera', soft_time_limit=110, time_limit=120)
 def analyze_camera_task(camera_id, token):
     from .services.adaptive_monitoring import analyze_reserved
     run_id = analyze_reserved(camera_id, token)
-    if run_id:
-        shadow_camera_task.apply_async(args=[run_id], queue='flood_training')
+    if run_id and getattr(settings, 'FLOOD_INTELLIGENCE_ENABLED', False):
+        from .services.model_lifecycle import reserve_shadow
+        if reserve_shadow(run_id):
+            shadow_camera_task.apply_async(args=[run_id], queue='flood_training', expires=120)
     return run_id
 
 
@@ -34,8 +42,9 @@ def shadow_camera_task(run_id):
 
 @shared_task(name='core.flood_camera_monitoring.tasks.train_candidate', soft_time_limit=3500, time_limit=3600)
 def train_flood_candidate():
-    from .services.retraining import train_candidate
-    return train_candidate()
+    # Old daily beat entries cannot start training; only explicit jobs may run.
+    from .services.learning_training import process_next_job
+    return process_next_job()
 
 
 @shared_task(name='core.flood_camera_monitoring.tasks.expire_evidence')
@@ -101,3 +110,28 @@ def refresh_predict_all_cache_task() -> int:
             "Failed to set predict_all cache", exc_info=True
         )
     return len(data)
+
+
+@shared_task(name='core.flood_camera_monitoring.tasks.learning_maintenance', soft_time_limit=55, time_limit=60)
+def learning_maintenance():
+    if not getattr(settings, 'FLOOD_INTELLIGENCE_ENABLED', False):
+        return
+    from .services.learning_data import ingest_run
+    from .services.learning_training import process_next_job
+    from .infra.models import CameraAnalysisRun
+    from django.utils import timezone
+    from datetime import timedelta
+    # A bounded, idempotent catch-up consumes persisted observations only.
+    pending = CameraAnalysisRun.objects.filter(started_at__gte=timezone.now()-timedelta(days=1),
+        episodeobservation__isnull=True).order_by('started_at').values_list('id', flat=True)[:100]
+    import time
+    started = time.monotonic()
+    for run_id in pending:
+        if time.monotonic() - started > 5:
+            break
+        try:
+            ingest_run(run_id)
+        except Exception:
+            logging.getLogger(__name__).exception('Unable to curate analysis %s', run_id)
+            continue
+    process_next_job()

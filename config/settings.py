@@ -293,6 +293,22 @@ CELERY_BEAT_SCHEDULE = {
     },
 }
 
+# A nonempty pilot list limits the new policy; an empty list selects all cameras.
+FLOOD_MONITORING_POLICY = os.getenv('FLOOD_MONITORING_POLICY', 'legacy')
+FLOOD_MONITORING_POLICY_EPOCH = os.getenv('FLOOD_MONITORING_POLICY_EPOCH', 'v1')
+FLOOD_MONITORING_PILOT_CAMERAS = tuple(filter(None, (
+    value.strip() for value in os.getenv('FLOOD_MONITORING_PILOT_CAMERAS', '').split(',')
+)))
+FLOOD_MONITORING_TREND_DELTA = float(os.getenv('FLOOD_MONITORING_TREND_DELTA', '5'))
+FLOOD_MONITORING_MAX_GAP_SECONDS = int(os.getenv('FLOOD_MONITORING_MAX_GAP_SECONDS', '600'))
+FLOOD_CAPACITY_CONTROL_ENABLED = os.getenv('FLOOD_CAPACITY_CONTROL_ENABLED', '0') == '1'
+if FLOOD_MONITORING_POLICY not in {'legacy', 'conservative'}:
+    raise ImproperlyConfigured('Unknown FLOOD_MONITORING_POLICY')
+if not 0 < FLOOD_MONITORING_TREND_DELTA <= 100 or FLOOD_MONITORING_MAX_GAP_SECONDS <= 0:
+    raise ImproperlyConfigured('Invalid monitoring trend thresholds')
+if not FLOOD_MONITORING_POLICY_EPOCH or len(FLOOD_MONITORING_POLICY_EPOCH) > 80:
+    raise ImproperlyConfigured('Invalid monitoring policy epoch')
+
 FLOOD_ADAPTIVE_ENABLED = os.getenv('FLOOD_ADAPTIVE_ENABLED', '0') == '1'
 FLOOD_PRIVATE_EVIDENCE_ROOT = os.getenv('FLOOD_PRIVATE_EVIDENCE_ROOT', '/app/private_flood_evidence')
 FLOOD_AUTOPUBLISH_ENABLED = os.getenv('FLOOD_AUTOPUBLISH_ENABLED', '0') == '1'
@@ -301,10 +317,18 @@ FLOOD_MODEL_REGISTRY_ROOT = os.getenv('FLOOD_MODEL_REGISTRY_ROOT', '/app/private
 FORECAST_MODEL_DIR = Path(os.getenv('FORECAST_MODEL_DIR', '/app/private_forecast_models'))
 FLOOD_REMOTE_PROVIDER_URL = os.getenv('FLOOD_REMOTE_PROVIDER_URL', '')
 FLOOD_REMOTE_PROVIDER_TOKEN = os.getenv('FLOOD_REMOTE_PROVIDER_TOKEN', '')
-if os.getenv('FLOOD_RETRAINING_ENABLED', '0') == '1':
-    CELERY_BEAT_SCHEDULE['flood-supervised-retraining'] = {
-        'task': 'core.flood_camera_monitoring.tasks.train_candidate', 'schedule': 86400.0,
-        'options': {'queue': 'flood_training'},
+# Retraining is exclusively initiated through durable administrator-created jobs.
+FLOOD_INTELLIGENCE_ENABLED = os.getenv('FLOOD_INTELLIGENCE_ENABLED', '0') == '1'
+FLOOD_CURATED_ROOT = os.getenv('FLOOD_CURATED_ROOT', '/app/private_flood_evidence/curated')
+FLOOD_CURATED_LIMIT_BYTES = int(os.getenv('FLOOD_CURATED_LIMIT_BYTES', str(10 * 1024**3)))
+FLOOD_MODEL_LIMIT_BYTES = int(os.getenv('FLOOD_MODEL_LIMIT_BYTES', str(5 * 1024**3)))
+FLOOD_REVIEW_NORMAL_THRESHOLD = float(os.getenv('FLOOD_REVIEW_NORMAL_THRESHOLD', '70'))
+FLOOD_REVIEW_PERSIST_SECONDS = int(os.getenv('FLOOD_REVIEW_PERSIST_SECONDS', '1800'))
+FLOOD_REVIEW_TIMEZONE = os.getenv('FLOOD_REVIEW_TIMEZONE', 'America/Sao_Paulo')
+if FLOOD_INTELLIGENCE_ENABLED:
+    CELERY_BEAT_SCHEDULE['flood-learning-maintenance'] = {
+        'task': 'core.flood_camera_monitoring.tasks.learning_maintenance', 'schedule': 30.,
+        'options': {'queue': 'flood_training', 'expires': 25},
     }
 
 # Web Push remains disabled until all VAPID values are supplied by the runtime.

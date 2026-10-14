@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
+from kombu.exceptions import OperationalError
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
@@ -19,6 +21,15 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _enqueue_deliveries(ids):
+    from .tasks import deliver_push_batch_task
+    try:
+        deliver_push_batch_task.delay([str(item) for item in ids])
+    except OperationalError:
+        logger.warning("push_enqueue_failed count=%s; recovery will retry", len(ids))
+
 
 
 def _alert_region_id(alert):
@@ -44,9 +55,7 @@ def fanout_alert(alert, kind: str) -> int:
         if created:
             pending_ids.append(delivery.id)
     if pending_ids:
-        from .tasks import deliver_push_batch_task
-
-        transaction.on_commit(lambda: deliver_push_batch_task.delay([str(i) for i in pending_ids]))
+        transaction.on_commit(lambda: _enqueue_deliveries(pending_ids))
     return len(pending_ids)
 
 
@@ -129,8 +138,7 @@ def fanout_event(event: NotificationEvent, kind=PushDelivery.Kind.CONFIRMED) -> 
         if created:
             pending_ids.append(delivery.id)
     if pending_ids:
-        from .tasks import deliver_push_batch_task
-        transaction.on_commit(lambda: deliver_push_batch_task.delay([str(i) for i in pending_ids]))
+        transaction.on_commit(lambda: _enqueue_deliveries(pending_ids))
     return len(pending_ids)
 
 
@@ -156,7 +164,7 @@ def publish_event(event: NotificationEvent, *, actor=None) -> NotificationEvent:
             "notification_event_published event=%s origin=%s users=%s devices=%s",
             event.pk, event.origin, audience["users"], audience["devices"],
         )
-        transaction.on_commit(lambda: fanout_event(event))
+        fanout_event(event)
         return event
 
 
@@ -274,8 +282,14 @@ def deliver_push(delivery_id, *, adapter=None) -> str:
         )
         if delivery.status in {PushDelivery.Status.SENT, PushDelivery.Status.EXPIRED}:
             return delivery.status
-        delivery.attempts += 1
         subscription = delivery.subscription
+        if not subscription.is_active:
+            delivery.status = PushDelivery.Status.EXPIRED
+            delivery.save(update_fields=["status", "updated_at"])
+            return delivery.status
+        if delivery.attempts >= settings.WEB_PUSH_MAX_ATTEMPTS:
+            return "exhausted"
+        delivery.attempts += 1
         try:
             adapter.send(
                 subscription_info={
@@ -295,8 +309,8 @@ def deliver_push(delivery_id, *, adapter=None) -> str:
             delivery.last_error = str(exc)[:255]
             delivery.save(update_fields=["attempts", "status", "last_error", "updated_at"])
             logger.warning(
-                "push_delivery_failed delivery=%s status=%s attempts=%s",
-                delivery.pk, delivery.status, delivery.attempts,
+                "push_delivery_failed delivery=%s status=%s attempts=%s http_status=%s",
+                delivery.pk, delivery.status, delivery.attempts, exc.status_code,
             )
             return delivery.status
         delivery.status = PushDelivery.Status.SENT
@@ -312,13 +326,15 @@ def deliver_push(delivery_id, *, adapter=None) -> str:
 def recover_failed_deliveries() -> int:
     ids = list(
         PushDelivery.objects.filter(
-            status=PushDelivery.Status.FAILED,
+            Q(status=PushDelivery.Status.FAILED) | Q(
+                status=PushDelivery.Status.PENDING,
+                updated_at__lte=timezone.now() - timedelta(minutes=5),
+            ),
             attempts__lt=settings.WEB_PUSH_MAX_ATTEMPTS,
             subscription__is_active=True,
-        ).values_list("id", flat=True)[: settings.WEB_PUSH_RECOVERY_BATCH_SIZE]
+        ).order_by("updated_at").values_list("id", flat=True)[: settings.WEB_PUSH_RECOVERY_BATCH_SIZE]
     )
     if ids:
-        PushDelivery.objects.filter(id__in=ids).update(status=PushDelivery.Status.PENDING)
         from .tasks import deliver_push_batch_task
 
         deliver_push_batch_task.delay([str(item) for item in ids])
