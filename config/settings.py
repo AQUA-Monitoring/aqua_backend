@@ -98,6 +98,7 @@ INSTALLED_APPS = [
 
 
 MIDDLEWARE = [
+    "config.api_errors.PublicApiErrorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     # CORS must be as high as possible, especially before CommonMiddleware
@@ -389,6 +390,7 @@ REDIS_CACHE_URL = os.getenv("REDIS_CACHE_URL", "redis://redis:6379/2")
 
 # Django REST Framework
 REST_FRAMEWORK = {
+    "EXCEPTION_HANDLER": "config.api_errors.exception_handler",
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PAGINATION_CLASS": "config.pagination.DefaultPageNumberPagination",
     # Default page size, can be overridden via ?page_size= and capped by paginator
@@ -414,3 +416,17 @@ SIMPLE_JWT = {
     "SIGNING_KEY": SECRET_KEY,
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
+
+# Operational alerts: SMTP is independent of Celery/Redis.
+EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+EMAIL_HOST = os.getenv("EMAIL_HOST", "")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "1") == "1"
+EMAIL_USE_SSL = os.getenv("EMAIL_USE_SSL", "0") == "1"
+EMAIL_TIMEOUT = 10
+DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "")
+OPS_EVENTS_DIR = os.getenv("OPS_EVENTS_DIR", "")
+
+FLOOD_EVIDENCE_MIN_FREE_BYTES = int(os.getenv("FLOOD_EVIDENCE_MIN_FREE_BYTES", str(2 * 1024 ** 3)))

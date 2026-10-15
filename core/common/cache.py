@@ -3,16 +3,22 @@ import time
 from typing import Any, Optional
 
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from django.conf import settings
 
 
 def get_redis() -> redis.Redis:
-    return redis.from_url(settings.REDIS_CACHE_URL, decode_responses=True)
+    return redis.from_url(settings.REDIS_CACHE_URL, decode_responses=True,
+                          socket_connect_timeout=1, socket_timeout=2,
+                          retry=Retry(NoBackoff(), 0))
 
 
 def get_binary_redis() -> redis.Redis:
     """Return an isolated Redis client that preserves binary values."""
-    return redis.from_url(settings.REDIS_CACHE_URL, decode_responses=False)
+    return redis.from_url(settings.REDIS_CACHE_URL, decode_responses=False,
+                          socket_connect_timeout=1, socket_timeout=2,
+                          retry=Retry(NoBackoff(), 0))
 
 
 def cache_set_json(key: str, value: Any, ex: Optional[int] = None) -> None:

@@ -48,7 +48,7 @@ class HealthcheckView(APIView):
         redis_ok = False
         redis_url = getattr(settings, "CELERY_BROKER_URL", "redis://redis:6379/0")
         try:
-            r = redis.from_url(redis_url)
+            r = redis.from_url(redis_url, socket_connect_timeout=1, socket_timeout=1)
             if r.ping():
                 redis_ok = True
         except Exception:

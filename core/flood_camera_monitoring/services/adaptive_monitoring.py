@@ -5,6 +5,8 @@ shorter than its lease. Evidence is written before model inference.
 """
 from datetime import timedelta
 import hashlib
+import errno
+import shutil
 from pathlib import Path
 import uuid
 
@@ -24,6 +26,12 @@ from .monitoring_capacity import enabled as capacity_enabled, sample_capacity
 
 def evidence_root():
     return Path(getattr(settings, 'FLOOD_PRIVATE_EVIDENCE_ROOT', '/app/private_flood_evidence')).resolve()
+
+
+def ensure_evidence_capacity(root, incoming_bytes):
+    reserve = int(getattr(settings, 'FLOOD_EVIDENCE_MIN_FREE_BYTES', 2 * 1024 ** 3))
+    if shutil.disk_usage(root).free < reserve + incoming_bytes:
+        raise OSError(errno.ENOSPC, 'Evidence storage reserve reached')
 
 
 def queue_for(level):
@@ -109,7 +117,10 @@ def analyze_reserved(camera_id, token):
     quality = []
     errors = []
     def preserve(_camera, frames):
-        folder = evidence_root() / str(run_id)
+        root = evidence_root()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ensure_evidence_capacity(root, sum(len(frame) for frame in frames))
+        folder = root / str(run_id)
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
         for index, frame in enumerate(frames):
             import cv2

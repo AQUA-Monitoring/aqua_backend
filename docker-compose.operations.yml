@@ -1,0 +1,38 @@
+# Add after the production/release manifests. No dependency on healthy DB/Redis.
+services:
+  web:
+    environment:
+      OPS_EVENTS_DIR: /var/lib/aqua-events
+    volumes:
+      - ops_events:/var/lib/aqua-events
+  operations-monitor:
+    image: ${AQUA_BACKEND_IMAGE:?Use the validated backend release image}
+    command: [python, manage.py, monitor_services]
+    env_file: [./.env]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      OPS_API_URL: http://web:8090
+      OPS_EVENTS_DIR: /var/lib/aqua-events
+      OPS_STATE_DIR: /var/lib/aqua-monitor
+      OPS_DISK_PATH: /host-srv
+      PGCONNECT_TIMEOUT: "5"
+      PGOPTIONS: "-c statement_timeout=5000"
+    volumes:
+      - ops_state:/var/lib/aqua-monitor
+      - ops_events:/var/lib/aqua-events:ro
+      - /srv/apps/aqua/rollout/disk-probe:/host-srv:ro
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: [CMD, python, -c, "import json,time; s=json.load(open('/var/lib/aqua-monitor/status.json')); assert time.time()-s['checked_at'] < 180 and s['email_delivery_ok']"]
+      interval: 60s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+volumes:
+  ops_state:
+  ops_events:
