@@ -88,3 +88,41 @@ A captura de evidências reserva 2 GiB livres antes de gravar um lote de imagens
 (`FLOOD_EVIDENCE_MIN_FREE_BYTES`). Ao atingir o limite, a análise registra falha
 em vez de consumir o espaço restante do banco. As evidências existentes são
 preservadas; alterar os 90 dias de retenção requer uma decisão operacional.
+
+## Configuração Gmail utilizada nesta instalação
+
+O envio usa o backend SMTP nativo do Django (`django.core.mail`):
+
+```dotenv
+EMAIL_HOST=smtp.gmail.com
+EMAIL_PORT=587
+EMAIL_USE_TLS=1
+EMAIL_USE_SSL=0
+EMAIL_HOST_USER=aqua.monitoramentogestao@gmail.com
+DEFAULT_FROM_EMAIL=aqua.monitoramentogestao@gmail.com
+EMAIL_HOST_PASSWORD=<senha de app configurada somente no servidor>
+```
+
+O serviço instalado é `aqua-operations-operations-monitor-1`; seu manifest está
+em `/srv/apps/aqua/rollout/20261015-operations/monitor.compose.yml`. Ele lê
+`/srv/apps/production/aqua/backend/.env`, não o `.env` do clone de desenvolvimento.
+Depois de alterar a credencial, recrie somente esse serviço:
+
+```sh
+docker compose -p aqua-operations \
+  -f /srv/apps/aqua/rollout/20261015-operations/monitor.compose.yml \
+  up -d --no-deps operations-monitor
+```
+
+Para inspecionar o estado sem exibir credenciais ou destinatários:
+
+```sh
+docker exec aqua-operations-operations-monitor-1 python -c \
+  'import json; print(json.load(open("/var/lib/aqua-monitor/status.json")))'
+```
+
+O healthcheck exige um ciclo recente e `email_delivery_ok=true`. Esse indicador
+reflete a configuração e as tentativas do ciclo; não é um comprovante de leitura
+ou de entrega na caixa de entrada. A confirmação SMTP é registrada separadamente
+no teste inicial autorizado. Não execute outro processo do monitor usando o
+mesmo diretório de estado: ele foi projetado para uma única instância.
