@@ -26,3 +26,4 @@ psycopg[binary]>=3.2.1
 mercadopago==2.3.0
 python-magic==0.4.27
 prometheus-client>=0.21.1,<1.0
+google-auth[requests]>=2.40.0,<3.0
