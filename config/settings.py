@@ -37,6 +37,8 @@ ALLOWED_HOSTS = ["*"]
 
 CORS_ALLOW_ALL_ORIGINS = True
 
+CORS_ALLOW_CREDENTIALS = True
+
 CSRF_TRUSTED_ORIGINS = [
     # Subdomínios de fexcompany.me
     "https://*.fexcompany.me",
@@ -89,11 +91,22 @@ INSTALLED_APPS = [
     "allauth.socialaccount.providers.google",
 ]
 
+SITE_ID = 1
+HEADLESS_ONLY = True
+
+HEADLESS_FRONTEND_URLS = {
+    "account_confirm_email": "http://localhost:5173/account/verify-email/{key}",
+    "account_reset_password": "http://localhost:5173/account/password/reset",
+    "account_reset_password_from_key": "http://localhost:5173/account/password/reset/key/{key}",
+    "account_signup": "http://localhost:5173/account/signup",
+    "socialaccount_login_error": "http://localhost:5173/login",
+}
+
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     # CORS must be as high as possible, especially before CommonMiddleware
-    "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",

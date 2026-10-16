@@ -53,6 +53,7 @@ urlpatterns = [
     path("api/blog/", include("core.blog.presentation.urls")),
     path("api/export/", ExportView.as_view(), name="export-data"),
     path('accounts/', include('allauth.urls')),
+    path("_allauth/", include("allauth.headless.urls")),    
 
 ]
 
