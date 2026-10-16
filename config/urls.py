@@ -19,6 +19,8 @@ from config.core_health import health
 from config.media import serve_media
 from core.flood_camera_monitoring.presentation.metrics_views import internal_metrics
 
+from core.users.presentation.google_auth import GoogleConfigView, GoogleLoginView
+
 router = DefaultRouter()
 
 urlpatterns = [
@@ -37,6 +39,8 @@ urlpatterns = [
         SpectacularRedocView.as_view(url_name="schema"),
         name="redoc",
     ),
+    path("api/auth/google/config/", GoogleConfigView.as_view(), name="google-auth-config"),
+    path("api/auth/google/", GoogleLoginView.as_view(), name="google-auth-login"),
     # JWT auth endpoints
     # Single auth token route using email/password
     path(
