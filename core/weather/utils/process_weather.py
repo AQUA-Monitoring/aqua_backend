@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, date
-from core.weather.clients import elevation_API, get_past_weather, get_forecast_weather
+from core.weather.clients import elevation_API, get_past_weather, get_forecast_weather, flood_API
 
 def normalize_date(value):
     if isinstance(value, datetime):
@@ -21,6 +21,10 @@ def process_weather(lat, lon, start, end):
     if elevation:
         results.append(elevation)
 
+    flood = flood_API(lat, lon)
+    if flood:
+        results.append(flood)
+    
     if end < today:
         past_end = min(end, today)
         past = get_past_weather(lat, lon, start, past_end)
