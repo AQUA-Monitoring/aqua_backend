@@ -16,9 +16,11 @@ def fill_weather(lat, lon, neighborhood, start, end):
         pass
 
     elevation_value = None
+    flood_value = None
     for r in results:
         if isinstance(r, dict) and 'results' in r and isinstance(r['results'], list) and r['results']:
             elevation_value = r['results'][0].get('elevation')
+            flood_value = r['results'][0].get('flood')
             break
 
     for result in results:
@@ -51,7 +53,7 @@ def fill_weather(lat, lon, neighborhood, start, end):
                     humidity=humidity[i] if i < len(humidity) else None,
                     elevation=elevation_value,
                     pressure=pressure[i] if i < len(pressure) else None,
-                    river_discharge=precipitation[i] if i < len(precipitation) else None,
+                    river_discharge=flood_value
                 )
             )
 
