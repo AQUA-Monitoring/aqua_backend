@@ -212,14 +212,28 @@ def create_camera_event(publication, event_kind: str) -> NotificationEvent:
     return event
 
 
-def create_flood_point_event(point, *, actor=None) -> NotificationEvent:
+def create_flood_point_event(point, *, actor=None, change=None) -> NotificationEvent:
+    revision_id = point.spatial_event.current_revision_id if change else None
+    key = f"flood-point:{point.pk}" if not change else f"flood-point:{point.pk}:{revision_id}:{change}"
+    ended = change == "ended"
+    title = "Ponto de alagamento encerrado" if ended else (
+        "Ponto de alagamento atualizado" if change else "Novo ponto de alagamento"
+    )
+    message = (
+        f"O ponto de alagamento em {point.neighborhood.name} foi encerrado."
+        if ended else (
+            f"O ponto de alagamento em {point.neighborhood.name} foi atualizado. "
+            f"Término previsto: {timezone.localtime(point.finished_at):%d/%m/%Y %H:%M}."
+            if change else f"Foi registrado um ponto de alagamento em {point.neighborhood.name}."
+        )
+    )
     event, created = NotificationEvent.objects.get_or_create(
-        idempotency_key=f"flood-point:{point.pk}",
+        idempotency_key=key,
         defaults={
             "origin": NotificationEvent.Origin.FLOOD_POINT,
-            "severity": NotificationEvent.Severity.CRITICAL,
-            "title": "Novo ponto de alagamento",
-            "message": f"Foi registrado um ponto de alagamento em {point.neighborhood.name}.",
+            "severity": NotificationEvent.Severity.INFO if ended else NotificationEvent.Severity.CRITICAL,
+            "title": title,
+            "message": message,
             "destination_url": "/",
             "flood_point": point,
             "actor": actor,

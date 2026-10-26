@@ -5,6 +5,7 @@ from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.db import transaction
+from django.db.models import Q
 from rest_framework import serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -37,13 +38,18 @@ class MonitoringView(APIView):
             'level', 'reason', 'next_analysis_at', 'strong_streak', 'clear_streak', 'lease_until',
             'lease_started_at', 'capacity_deferred_at').first()
         runs = []
-        for run in CameraAnalysisRun.objects.filter(camera_id=camera_id).prefetch_related('evidence', 'reviews').order_by('-started_at')[:50]:
+        query = CameraAnalysisRun.objects.filter(camera_id=camera_id)
+        if request.query_params.get('saved') == 'true':
+            query = query.filter(Q(evidence__preserved_at__isnull=False) | Q(evidence__extreme_preserved=True), evidence__deleted_at__isnull=True).distinct()
+        page = serializers.IntegerField(min_value=1, max_value=100000).run_validation(request.query_params.get('page', 1))
+        count = query.count()
+        for run in query.prefetch_related('evidence', 'reviews').order_by('-started_at')[(page-1)*50:page*50]:
             evidence = []
             for item in run.evidence.all():
-                if item.deleted_at or item.expires_at <= timezone.now():
+                if item.deleted_at or (not (item.preserved_at or item.extreme_preserved) and min(item.expires_at, item.captured_at + timedelta(days=15)) <= timezone.now()):
                     continue
                 token = signing.dumps({'id': str(item.pk), 'user': str(request.user.pk)}, salt='flood-evidence')
-                evidence.append({'id': item.pk, 'sha256': item.sha256, 'captured_at': item.captured_at,
+                evidence.append({'id': item.pk, 'sha256': item.sha256, 'captured_at': item.captured_at, 'preserved': bool(item.preserved_at), 'extreme_preserved': item.extreme_preserved, 'expires_at': min(item.expires_at, item.captured_at + timedelta(days=15)),
                     'url': f'/api/flood_monitoring/evidence/{item.pk}/?token={token}'})
             runs.append({'id': run.pk, 'started_at': run.started_at, 'finished_at': run.finished_at,
                 'level': run.level, 'result': run.result, 'frames': run.frames,
@@ -52,7 +58,7 @@ class MonitoringView(APIView):
                 'reviews': list(run.reviews.values('id', 'classification', 'reason', 'approved', 'created_at'))})
         from core.flood_camera_monitoring.services.monitoring_projection import monitoring_projection
         state, capacity = monitoring_projection(camera_id, state, runs[0] if runs else None, timezone.now())
-        return Response({'monitoring': state, 'runs': runs, 'capacity': capacity})
+        return Response({'monitoring': state, 'runs': runs, 'capacity': capacity, 'count': count, 'page': page})
 
     def post(self, request, camera_id):
         camera = get_object_or_404(Camera, pk=camera_id, status=1)
@@ -81,7 +87,7 @@ class EvidenceView(APIView):
             return Response({'detail': 'Link expirado ou inválido'}, status=403)
         if payload != {'id': str(evidence_id), 'user': str(request.user.pk)}:
             return Response(status=403)
-        item = get_object_or_404(CameraEvidence, pk=evidence_id, deleted_at__isnull=True, expires_at__gt=timezone.now())
+        item = get_object_or_404(CameraEvidence.objects.filter(Q(preserved_at__isnull=False) | Q(extreme_preserved=True) | (Q(expires_at__gt=timezone.now()) & Q(captured_at__gt=timezone.now()-timedelta(days=15)))), pk=evidence_id, deleted_at__isnull=True)
         path = (evidence_root() / item.relative_path).resolve()
         if not path.is_relative_to(evidence_root()) or not path.is_file():
             return Response(status=404)
@@ -89,6 +95,33 @@ class EvidenceView(APIView):
         response['Cache-Control'] = 'private, no-store'
         response['X-Content-Type-Options'] = 'nosniff'
         return response
+
+
+    def patch(self, request, evidence_id):
+        class PreservationInput(serializers.Serializer):
+            preserved = serializers.BooleanField(required=True)
+        if not request.user.is_active:
+            return Response(status=403)
+        data = PreservationInput(data=request.data)
+        data.is_valid(raise_exception=True)
+        with transaction.atomic():
+            item = get_object_or_404(CameraEvidence.objects.select_for_update(), pk=evidence_id, deleted_at__isnull=True)
+            keep = data.validated_data['preserved']
+            if keep and not item.preserved_at:
+                if not (evidence_root() / item.relative_path).is_file():
+                    return Response({'detail': 'Imagem indisponível.'}, status=404)
+                item.preserved_at = timezone.now()
+                item.preserved_by = request.user
+            elif not keep:
+                item.preserved_at = None
+                item.preserved_by = None
+            else:
+                return Response({'preserved': True})
+            item.save(update_fields=['preserved_at', 'preserved_by'])
+            MonitoringAudit.objects.create(camera_id=item.run.camera_id, actor=request.user,
+                action='EVIDENCE_PRESERVE' if keep else 'EVIDENCE_RELEASE',
+                details={'evidence_id': str(item.pk)})
+        return Response({'preserved': keep})
 
 
 class ReviewView(APIView):

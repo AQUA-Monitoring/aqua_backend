@@ -282,7 +282,7 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'core.flood_camera_monitoring.tasks.dispatch_due_cameras', 'schedule': 10.0,
     },
     'flood-evidence-retention': {
-        'task': 'core.flood_camera_monitoring.tasks.expire_evidence', 'schedule': 3600.0,
+        'task': 'core.flood_camera_monitoring.tasks.expire_evidence', 'schedule': 300.0,
     },
     "flood-analyze-all-cameras": {
         "task": "core.flood_camera_monitoring.infra.tasks.analyze_all_cameras_task",
@@ -430,6 +430,7 @@ DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "")
 OPS_EVENTS_DIR = os.getenv("OPS_EVENTS_DIR", "")
 
 FLOOD_EVIDENCE_MIN_FREE_BYTES = int(os.getenv("FLOOD_EVIDENCE_MIN_FREE_BYTES", str(2 * 1024 ** 3)))
+FLOOD_EXTREME_EVIDENCE_LIMIT = int(os.getenv("FLOOD_EXTREME_EVIDENCE_LIMIT", "50"))
 
 # Google Identity Services public Web OAuth client ID; blank disables login.
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()

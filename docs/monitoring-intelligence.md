@@ -143,3 +143,9 @@ Foram usados PostgreSQL/PostGIS e Redis exclusivos, sem copiar dados de produç�
 
 A observação de 24 horas em uma câmera real e a avaliação de qualidade dependem
 explicitamente da ativação e da base humana, e não são substituídas por esse ensaio.
+
+## Retenção de imagens operacionais
+
+A cada cinco minutos, a tarefa `flood-evidence-retention` remove em lotes de até 5.000 arquivos as evidências com mais de 15 dias, inclusive registros antigos criados sob a política de 90 dias. Os metadados de auditoria permanecem no banco. Imagens salvas manualmente e a curadoria de treinamento são preservadas.
+
+O arquivo automático mantém até 50 imagens no total (`FLOOD_EXTREME_EVIDENCE_LIMIT`, de 0 a 100), sem hashes repetidos e com no máximo uma imagem por câmera por dia. São elegíveis apenas análises sem erro, com modelo identificado, qualidade utilizável, classificação `FLOOD_INDICATION` e probabilidade de alagamento válida do quadro. A seleção prioriza os maiores valores dessa probabilidade. A pontuação mede a confiança do modelo, não a altura da água. As melhores imagens substituem as anteriores; imagens substituídas voltam à retenção normal. A API identifica essas imagens com `extreme_preserved` e inclui-as no filtro `saved=true`.

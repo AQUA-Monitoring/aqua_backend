@@ -5,6 +5,8 @@ from uuid import UUID
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import D
 from django.db import connections, transaction
+from django.db.models.deletion import ProtectedError
+from core.users.password_confirmation import AdminPasswordThrottle, require_admin_password
 from django.db.models import Case, IntegerField, Q, Value, When
 from django.utils import timezone
 from rest_framework import permissions, status, viewsets
@@ -245,8 +247,13 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
     }
     default_ordering = ["_operational_priority", "description"]
 
+    def get_throttles(self):
+        if self.action in {"destroy"}:
+            return [AdminPasswordThrottle()]
+        return super().get_throttles()
+
     def get_permissions(self):
-        if self.action in {"create", "update", "partial_update"}:
+        if self.action in {"create", "update", "partial_update", "destroy"}:
             return [permissions.IsAuthenticated(), IsAppAdmin()]
         return [permissions.AllowAny()]
 
@@ -442,6 +449,26 @@ class CameraMetadataViewSet(SafeOrderingMixin, viewsets.ViewSet):
                 },
             ).data
         )
+
+    def destroy(self, request, pk=None):
+        require_admin_password(request)
+        try:
+            camera_id = UUID(str(pk))
+        except (ValueError, TypeError, AttributeError):
+            camera_id = None
+        try:
+            with transaction.atomic():
+                camera = Camera.objects.select_for_update().filter(pk=camera_id).first()
+                if camera is None:
+                    return Response({"detail": "Câmera não encontrada."}, status=status.HTTP_404_NOT_FOUND)
+                camera.delete()
+                transaction.on_commit(_invalidate_predict_all_cache)
+        except ProtectedError:
+            return Response(
+                {"detail": "Esta câmera possui histórico protegido e não pode ser excluída. Você pode desativá-la."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def update(self, request, pk=None):
         return self._update(request, pk)

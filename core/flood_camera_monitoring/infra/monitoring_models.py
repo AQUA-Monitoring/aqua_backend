@@ -61,6 +61,9 @@ class CameraEvidence(models.Model):
     captured_at = models.DateTimeField()
     expires_at = models.DateTimeField(db_index=True)
     deleted_at = models.DateTimeField(null=True)
+    extreme_preserved = models.BooleanField(default=False)
+    preserved_at = models.DateTimeField(null=True, blank=True)
+    preserved_by = models.ForeignKey("users.User", null=True, blank=True, on_delete=models.PROTECT, related_name="preserved_camera_evidence")
     size = models.PositiveIntegerField()
 
 

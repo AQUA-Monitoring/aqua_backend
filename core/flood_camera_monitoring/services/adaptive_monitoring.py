@@ -227,7 +227,7 @@ def analyze_reserved(camera_id, token):
                 'queue_delay_seconds': max(0, (started - (state.lease_reserved_at or started)).total_seconds())},
             latency_ms=int((now-started).total_seconds()*1000), error_code=error_code)
         for values in stored:
-            CameraEvidence.objects.create(run=run, expires_at=now+timedelta(days=90), **values)
+            CameraEvidence.objects.create(run=run, expires_at=values["captured_at"]+timedelta(days=15), **values)
         if old_level != locked.level:
             MonitoringAudit.objects.create(camera=camera, action='INTENSITY_CHANGED',
                 details={'from': old_level, 'to': locked.level, 'reason': locked.reason,
@@ -245,14 +245,6 @@ def analyze_reserved(camera_id, token):
     return str(run.id)
 
 
-def expire_evidence(batch_size=500):
-    now = timezone.now()
-    count = 0
-    for item in CameraEvidence.objects.filter(expires_at__lte=now, deleted_at__isnull=True)[:batch_size]:
-        path = (evidence_root() / item.relative_path).resolve()
-        if not path.is_relative_to(evidence_root()):
-            raise ValueError('Evidence path outside private storage')
-        path.unlink(missing_ok=True)
-        CameraEvidence.objects.filter(pk=item.pk, deleted_at__isnull=True).update(deleted_at=now)
-        count += 1
-    return count
+def expire_evidence(batch_size=5000):
+    from .evidence_retention import expire_evidence as expire
+    return expire(batch_size=batch_size)
