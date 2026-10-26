@@ -430,3 +430,6 @@ DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "")
 OPS_EVENTS_DIR = os.getenv("OPS_EVENTS_DIR", "")
 
 FLOOD_EVIDENCE_MIN_FREE_BYTES = int(os.getenv("FLOOD_EVIDENCE_MIN_FREE_BYTES", str(2 * 1024 ** 3)))
+
+# Google Identity Services public Web OAuth client ID; blank disables login.
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
